@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  caddy:
+    image: caddy:alpine
+    container_name: last-chance-proxy
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    environment:
+      - DOMAIN=${DOMAIN}
+      - STEALTH_HEADER_NAME=${STEALTH_HEADER_NAME}
+      - STEALTH_HEADER_VALUE=${STEALTH_HEADER_VALUE}
+      - ACME_EMAIL=${ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - internal
+
+  relay-node:
+    build: ./node
+    container_name: last-chance-relay
+    restart: unless-stopped
+    environment:
+      - STEALTH_HEADER_NAME=${STEALTH_HEADER_NAME}
+      - STEALTH_HEADER_VALUE=${STEALTH_HEADER_VALUE}
+      - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET}
+    expose:
+      - "8080"
+    networks:
+      - internal
+
+  file-node:
+    build: ./file_api
+    container_name: last-chance-files
+    restart: unless-stopped
+    environment:
+      - STEALTH_HEADER_NAME=${STEALTH_HEADER_NAME}
+      - STEALTH_HEADER_VALUE=${STEALTH_HEADER_VALUE}
+    volumes:
+      - vault_data:/tmp/lastchance_vault
+    expose:
+      - "8081"
+    networks:
+      - internal
+
+volumes:
+  caddy_data:
+  caddy_config:
+  vault_data:
+
+networks:
+  internal:
+    driver: bridge

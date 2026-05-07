@@ -1,0 +1,61 @@
+{
+    email {$ACME_EMAIL}
+    admin off
+    auto_https disable_redirects
+}
+
+{$DOMAIN} {
+    tls {
+        protocols tls1.3
+    }
+
+    # Стелс-фильтр: совпадает с nginx-логикой
+    @stealth {
+        header {$STEALTH_HEADER_NAME} {$STEALTH_HEADER_VALUE}
+    }
+
+    # === Защищённые эндпоинты ===
+    handle @stealth {
+        # API сообщений /api-v1/*
+        handle /api-v1/* {
+            reverse_proxy relay-node:8080 {
+                header_up X-Real-IP {remote_host}
+                header_up X-Forwarded-For {remote_host}
+            }
+        }
+
+        # Файловое API /file-api/*
+        handle /file-api/* {
+            reverse_proxy file-node:8081 {
+                header_up X-Real-IP {remote_host}
+                header_up X-Forwarded-For {remote_host}
+                flush_interval -1
+            }
+        }
+
+        # Админка (заглушка)
+        handle /admin/* {
+            reverse_proxy relay-node:8080
+        }
+
+        # Всё остальное под стелс-заголовком
+        handle {
+            respond "" 404
+        }
+    }
+
+    # Без заголовка — молча 403
+    handle {
+        respond "" 403
+    }
+
+    log {
+        output file /var/log/caddy/last-chance.log
+        format json
+    }
+}
+
+# Доступ по IP — молча 403
+http:// {
+    respond "" 403
+}
