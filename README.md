@@ -31,14 +31,13 @@ The system consists of two specialized nodes orchestrated by a Caddy reverse pro
 
 This is an open-source project dedicated to secure communications. We highly encourage community audits. If you find vulnerabilities or have suggestions regarding:
 
-    Ed25519 implementation logic.
-
-    Race conditions in the FileStore mutexes.
-
-    Proxy bypass techniques.
+ - Ed25519 implementation logic.
+ - Race conditions in the FileStore mutexes.
+ - Proxy bypass techniques.
 
 Please reach out via the secure channels below.
-Support & Donation
+
+### Support & Donation
 
 If this project helped you stay connected, consider supporting the maintenance:
 
@@ -52,12 +51,13 @@ If this project helped you stay connected, consider supporting the maintenance:
 
 ### Contact & Feedback
 
-    Session ID: 05f08d7242fe9cd621e98ef902cd1a21a8bf10d0c7c946e8c8e469d2396657a637
+   Session ID: 05f08d7242fe9cd621e98ef902cd1a21a8bf10d0c7c946e8c8e469d2396657a637
 
-    ProtonMail: nabla.shell@proton.me
+   ProtonMail: nabla.shell@proton.me
 
-    PGP Public Key: [here](https://github.com/NablaShell/LastChance/docs/public_key.asc) 
-    *PGP Fingerprint: 885F 3675 1D87 3F99 55ED 0ABC D1F6 A559 1458 507D*
+   PGP Public Key: [here](https://github.com/NablaShell/LastChance/docs/public_key.asc) 
+   
+   *PGP Fingerprint: 885F 3675 1D87 3F99 55ED 0ABC D1F6 A559 1458 507D*
 
 
 ##  License
