@@ -11,7 +11,6 @@ frontend/dist/
 frontend/src/wailsjs/
 
 # --- Personal Data & Sensitive Info (CRITICAL) ---
-# Никогда не пушим личные данные, ключи и базу
 person_data/
 .env
 identity.json

@@ -1,18 +1,19 @@
-version: "3.9"
-
 services:
   caddy:
     image: caddy:alpine
-    container_name: last-chance-proxy
+    container_name: revers-proxy
     restart: unless-stopped
     ports:
       - "443:443"
       - "80:80"
+    depends_on:
+      - sms-relay
+      - file-relay
     environment:
-      - DOMAIN=${DOMAIN}
-      - STEALTH_HEADER_NAME=${STEALTH_HEADER_NAME}
-      - STEALTH_HEADER_VALUE=${STEALTH_HEADER_VALUE}
-      - ACME_EMAIL=${ACME_EMAIL}
+      DOMAIN: ${DOMAIN}
+      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME}
+      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE}
+      ACME_EMAIL: ${ACME_EMAIL}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -20,28 +21,36 @@ services:
     networks:
       - internal
 
-  relay-node:
+  sms-relay:
     build: ./node
-    container_name: last-chance-relay
+    container_name: sms-relay
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     environment:
-      - STEALTH_HEADER_NAME=${STEALTH_HEADER_NAME}
-      - STEALTH_HEADER_VALUE=${STEALTH_HEADER_VALUE}
-      - ADMIN_JWT_SECRET=${ADMIN_JWT_SECRET}
+      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME}
+      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE}
+      ADMIN_JWT_SECRET: ${ADMIN_JWT_SECRET}
     expose:
       - "8080"
     networks:
       - internal
 
-  file-node:
+  file-relay:
     build: ./file_api
-    container_name: last-chance-files
+    container_name: file-relay
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     environment:
-      - STEALTH_HEADER_NAME=${STEALTH_HEADER_NAME}
-      - STEALTH_HEADER_VALUE=${STEALTH_HEADER_VALUE}
+      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME}
+      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE}
     volumes:
-      - vault_data:/tmp/lastchance_vault
+      - ./data/vault:/var/lib/lastchance/vault
     expose:
       - "8081"
     networks:
@@ -50,7 +59,6 @@ services:
 volumes:
   caddy_data:
   caddy_config:
-  vault_data:
 
 networks:
   internal:

@@ -9,42 +9,36 @@
         protocols tls1.3
     }
 
-    # Стелс-фильтр: совпадает с nginx-логикой
+    # Anti-Scanning Stealth Layer
     @stealth {
         header {$STEALTH_HEADER_NAME} {$STEALTH_HEADER_VALUE}
     }
 
-    # === Защищённые эндпоинты ===
     handle @stealth {
-        # API сообщений /api-v1/*
+        # Core Message Relay API
         handle /api-v1/* {
-            reverse_proxy relay-node:8080 {
-                header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-For {remote_host}
-            }
+            reverse_proxy sms-relay:8080
         }
 
-        # Файловое API /file-api/*
+        # File Transfer API
         handle /file-api/* {
-            reverse_proxy file-node:8081 {
-                header_up X-Real-IP {remote_host}
-                header_up X-Forwarded-For {remote_host}
+            reverse_proxy file-relay:8081 {
                 flush_interval -1
             }
         }
 
-        # Админка (заглушка)
-        handle /admin/* {
-            reverse_proxy relay-node:8080
-        }
+        # TODO: Admin Dashboard Section
+        # handle /admin/* {
+        #     reverse_proxy admin-panel:8082
+        # }
 
-        # Всё остальное под стелс-заголовком
+        # Default fallback for authorized requests
         handle {
             respond "" 404
         }
     }
 
-    # Без заголовка — молча 403
+    # Unauthorized requests - Silent Drop
     handle {
         respond "" 403
     }
@@ -55,7 +49,7 @@
     }
 }
 
-# Доступ по IP — молча 403
+# Block direct IP access and insecure HTTP
 http:// {
     respond "" 403
 }

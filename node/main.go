@@ -1,232 +1,247 @@
+// Copyright (C) 2026 LastChance
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package main
 
 import (
-	"crypto/ed25519"
+	"bytes"
+	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
-	"strconv"
+	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"context"
 
-	_ "modernc.org/sqlite"
 	"golang.org/x/time/rate"
 )
 
-// --- Константы по ТЗ ---
-
 const (
-	// Сетка разрешённых размеров пакетов
-	SizeVeryTiny = 256
-	SizeTiny     = 1024
-	SizeSmall    = 4096
-	SizeMax      = 65536
+	// Limit size
+	RAMLimit  = 1 * 1024 * 1024   // 1 MB - store in memory
+	DiskLimit = 100 * 1024 * 1024 // 100 MB - maximum file size
 
-	MaxMessagesPerHash = 100
-	MessageTTL         = 24 * time.Hour
-	CleanupInterval    = 10 * time.Minute
-	MaxTimestampDiff   = 60 // секунд, защита от повторов
+	// TTL
+	RAMTTL  = 30 * time.Minute // Time to live in memory
+	DiskTTL = 1 * time.Hour    // Time to live on disk
+
+	// Paths
+	VaultPath = "/tmp/lastchance_vault" // Temporary storage
+
+	// Cleanup
+	CleanupInterval = 5 * time.Minute
 )
 
-// allowedSizes — карта для быстрой проверки O(1)
-var allowedSizes = map[int]bool{
-	SizeVeryTiny: true,
-	SizeTiny:     true,
-	SizeSmall:    true,
-	SizeMax:      true,
+// FileEntry - record of a file in storage
+type FileEntry struct {
+	Data       []byte    // Data for RAM files
+	FilePath   string    // Path for Disk files
+	Size       int64     // File size
+	IsDisk     bool      // true = on disk, false = in memory
+	CreatedAt  time.Time // Creation time
+	Downloaded bool      // Has it been downloaded?
 }
 
-// --- База данных в памяти ---
-
-type DB struct {
-	conn *sql.DB
+// FileStore - manages file storage in memory and on disk with thread safety
+type FileStore struct {
+	mu    sync.RWMutex
+	files map[string]*FileEntry // key = fileHash
 }
 
-func NewDB() (*DB, error) {
-	// mode=memory — чистая RAM, без файла
-	// _journal_mode=WAL — конкурентный доступ
-	conn, err := sql.Open("sqlite", ":memory:?_journal_mode=WAL")
-	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
+func NewFileStore() *FileStore {
+	return &FileStore{
+		files: make(map[string]*FileEntry),
 	}
-
-	// Включаем WAL (в памяти это не обязательно, но для привычки)
-	conn.Exec("PRAGMA journal_mode=WAL;")
-	conn.Exec("PRAGMA busy_timeout=5000;")
-
-	// Создаём таблицу строго по ТЗ
-	query := `
-	CREATE TABLE IF NOT EXISTS queue (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		target_hash TEXT NOT NULL,
-		payload BLOB NOT NULL,
-		size INTEGER NOT NULL,
-		created_at DATETIME DEFAULT (datetime('now'))
-	);
-	CREATE INDEX IF NOT EXISTS idx_target_hash ON queue(target_hash);
-	CREATE INDEX IF NOT EXISTS idx_created_at ON queue(created_at);
-	`
-	if _, err := conn.Exec(query); err != nil {
-		return nil, fmt.Errorf("create schema: %w", err)
-	}
-
-	return &DB{conn: conn}, nil
 }
 
-// SavePackage сохраняет пакет в очередь получателя
-func (db *DB) SavePackage(targetHash string, payload []byte, size int) error {
-	// Проверяем лимит очереди для этого хеша
-	var count int
-	err := db.conn.QueryRow(
-		"SELECT COUNT(*) FROM queue WHERE target_hash = ?",
-		targetHash,
-	).Scan(&count)
-	if err != nil {
-		return fmt.Errorf("count queue: %w", err)
-	}
-	if count >= MaxMessagesPerHash {
-		return errors.New("queue full")
+// SaveToRAM - saves file in memory
+func (fs *FileStore) SaveToRAM(fileHash string, data []byte) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	// Copy data
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+
+	now := time.Now().UTC()
+	fs.files[fileHash] = &FileEntry{
+		Data:       dataCopy,
+		Size:       int64(len(data)),
+		IsDisk:     false,
+		CreatedAt:  now,
+		Downloaded: false,
 	}
 
-	// Вставляем пакет
-	_, err = db.conn.Exec(
-		"INSERT INTO queue (target_hash, payload, size) VALUES (?, ?, ?)",
-		targetHash, payload, size,
-	)
-	if err != nil {
-		return fmt.Errorf("insert package: %w", err)
-	}
 	return nil
 }
 
-// PullPackages атомарно забирает и удаляет пакеты для хеша
-// Возвращает слайс payload'ов и их размеры
-func (db *DB) PullPackages(targetHash string) ([][]byte, []int, error) {
-	tx, err := db.conn.Begin()
-	if err != nil {
-		return nil, nil, fmt.Errorf("begin tx: %w", err)
+// SaveToDisk - saves file on disk
+func (fs *FileStore) SaveToDisk(fileHash string, reader io.Reader, size int64) error {
+	// Create directory if it doesn't exist
+	if err := os.MkdirAll(VaultPath, 0700); err != nil {
+		return fmt.Errorf("failed to create vault: %w", err)
 	}
-	defer tx.Rollback()
 
-	// Читаем всё для этого хеша
-	rows, err := tx.Query(
-		"SELECT payload, size FROM queue WHERE target_hash = ? ORDER BY id ASC",
-		targetHash,
-	)
+	// Create temporary file
+	tmpFile, err := os.CreateTemp(VaultPath, "file-*.tmp")
 	if err != nil {
-		return nil, nil, fmt.Errorf("select packages: %w", err)
+		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer rows.Close()
+	defer os.Remove(tmpFile.Name())
 
-	var payloads [][]byte
-	var sizes []int
+	// Copy data
+	written, err := io.Copy(tmpFile, reader)
+	if err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to write file: %w", err)
+	}
 
-	for rows.Next() {
-		var payload []byte
-		var size int
-		if err := rows.Scan(&payload, &size); err != nil {
-			return nil, nil, fmt.Errorf("scan package: %w", err)
+	if written != size {
+		tmpFile.Close()
+		return fmt.Errorf("size mismatch: expected %d, wrote %d", size, written)
+	}
+
+	// Sync to disk
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	// Close before renaming
+	tmpFile.Close()
+
+	finalPath := filepath.Join(VaultPath, fileHash+".bin")
+	if err := os.Rename(tmpFile.Name(), finalPath); err != nil {
+		return fmt.Errorf("failed to rename file: %w", err)
+	}
+
+	// Set rights only for the owner
+	os.Chmod(finalPath, 0600)
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	now := time.Now().UTC()
+	fs.files[fileHash] = &FileEntry{
+		FilePath:   finalPath,
+		Size:       size,
+		IsDisk:     true,
+		CreatedAt:  now,
+		Downloaded: false,
+	}
+
+	return nil
+}
+
+// Get - retrieves a file
+func (fs *FileStore) Get(fileHash string) (*FileEntry, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	entry, exists := fs.files[fileHash]
+	if !exists {
+		return nil, errors.New("file not found")
+	}
+
+	entry.Downloaded = true
+
+	return entry, nil
+}
+
+// Delete - deletes a file with shredding
+func (fs *FileStore) Delete(fileHash string) {
+	fs.mu.Lock()
+	entry, exists := fs.files[fileHash]
+	if exists {
+		delete(fs.files, fileHash)
+	}
+	fs.mu.Unlock()
+
+	if !exists {
+		return
+	}
+
+	// If the file is on disk, overwrite it using shred
+	if entry.IsDisk && entry.FilePath != "" {
+		// Try to use shred if available
+		if _, err := exec.LookPath("shred"); err == nil {
+			cmd := exec.Command("shred", "-u", "-n", "3", entry.FilePath)
+			if err := cmd.Run(); err != nil {
+				log.Printf("Shred failed for %s: %v, falling back to remove", fileHash[:8], err)
+				os.Remove(entry.FilePath)
+			}
+		} else {
+			// Fallback - simple removal
+			os.Remove(entry.FilePath)
 		}
-		payloads = append(payloads, payload)
-		sizes = append(sizes, size)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("rows iteration: %w", err)
-	}
-
-	// Удаляем всё для этого хеша
-	if _, err := tx.Exec(
-		"DELETE FROM queue WHERE target_hash = ?",
-		targetHash,
-	); err != nil {
-		return nil, nil, fmt.Errorf("delete packages: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, nil, fmt.Errorf("commit tx: %w", err)
-	}
-
-	return payloads, sizes, nil
 }
 
-// Cleanup удаляет старые пакеты (старше TTL)
-func (db *DB) Cleanup(olderThan time.Time) (int64, error) {
-	result, err := db.conn.Exec(
-		"DELETE FROM queue WHERE created_at < ?",
-		olderThan.UTC().Format("2006-01-02 15:04:05"),
-	)
-	if err != nil {
-		return 0, fmt.Errorf("cleanup: %w", err)
+// Cleanup - cleans outdated files
+func (fs *FileStore) Cleanup() int {
+	now := time.Now().UTC()
+	removed := 0
+	toDelete := make([]string, 0)
+
+	fs.mu.Lock()
+	for hash, entry := range fs.files {
+		shouldRemove := false
+
+		if entry.Downloaded {
+			// Delete immediately after downloading
+			shouldRemove = true
+		} else if entry.IsDisk && now.Sub(entry.CreatedAt) > DiskTTL {
+			shouldRemove = true
+		} else if !entry.IsDisk && now.Sub(entry.CreatedAt) > RAMTTL {
+			shouldRemove = true
+		}
+
+		if shouldRemove {
+			delete(fs.files, hash)
+			removed++
+
+			if entry.IsDisk && entry.FilePath != "" {
+				toDelete = append(toDelete, entry.FilePath)
+			}
+		}
 	}
-	removed, _ := result.RowsAffected()
-	return removed, nil
+	fs.mu.Unlock()
+
+	// Asynchronously deleting files from disk
+	for _, path := range toDelete {
+		go func(p string) {
+			if _, err := exec.LookPath("shred"); err == nil {
+				exec.Command("shred", "-u", "-n", "10", p).Run()
+			} else {
+				os.Remove(p)
+			}
+		}(path)
+	}
+
+	return removed
 }
 
-// Close закрывает соединение с БД
-func (db *DB) Close() error {
-	return db.conn.Close()
-}
-
-// --- Криптография и авторизация ---
-
-// verifyAuth проверяет подпись Ed25519 по ТЗ
-func verifyAuth(identityKeyHex, timestampStr, signatureHex, targetHash string) error {
-	// 1. Проверка времени (±60 секунд)
-	ts, err := strconv.ParseInt(timestampStr, 10, 64)
-	if err != nil {
-		return errors.New("invalid timestamp format")
-	}
-	now := time.Now().Unix()
-	diff := now - ts
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff > MaxTimestampDiff {
-		return errors.New("timestamp expired")
-	}
-
-	// 2. Декодируем публичный ключ из hex
-	pubKey, err := hex.DecodeString(identityKeyHex)
-	if err != nil || len(pubKey) != ed25519.PublicKeySize {
-		return errors.New("invalid public key format")
-	}
-
-	// 3. Проверяем соответствие хеша
-	hash := sha256.Sum256(pubKey)
-	computedHash := hex.EncodeToString(hash[:])
-	if computedHash != targetHash {
-		return errors.New("identity key does not match target hash")
-	}
-
-	// 4. Формируем сообщение: timestamp + identity_hash
-	message := fmt.Sprintf("%s%s", timestampStr, targetHash)
-
-	// 5. Декодируем подпись
-	signature, err := hex.DecodeString(signatureHex)
-	if err != nil || len(signature) != ed25519.SignatureSize {
-		return errors.New("invalid signature format")
-	}
-
-	// 6. Проверяем Ed25519 подпись
-	if !ed25519.Verify(pubKey, []byte(message), signature) {
-		return errors.New("signature verification failed")
-	}
-
-	return nil
-}
-
-// --- Rate Limiter ---
-
+// RateLimiter - brute force protection
 type RateLimiter struct {
 	mu       sync.Mutex
 	limiters map[string]*rate.Limiter
@@ -242,238 +257,331 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	l, exists := rl.limiters[ip]
+	limiter, exists := rl.limiters[ip]
 	if !exists {
-		// 5 запросов в секунду с burst 10
-		l = rate.NewLimiter(rate.Limit(5), 10)
-		rl.limiters[ip] = l
+		// 5 requests per second, burst 10
+		limiter = rate.NewLimiter(5, 10)
+		rl.limiters[ip] = limiter
 	}
-	return l.Allow()
+
+	return limiter.Allow()
 }
 
-// Очистка старых лимитеров каждые 10 минут
 func (rl *RateLimiter) Cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	// Можно реализовать удаление давно неактивных IP
-	// Пока оставляем как есть
+	rl.limiters = make(map[string]*rate.Limiter)
 }
 
-// --- HTTP Server ---
-
+// Server - file server
 type Server struct {
-	db          *DB
+	store       *FileStore
 	rateLimiter *RateLimiter
 }
 
-// handlePush — POST /push/{target_hash}
-func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
-	targetHash := r.PathValue("target_hash")
-	ip := getClientIP(r)
-
-	// Проверка размера по сетке
-	if !allowedSizes[int(r.ContentLength)] {
-		log.Printf("[PUSH] %s: invalid size %d", ip, r.ContentLength)
-		http.Error(w, "Invalid Payload Size", http.StatusBadRequest)
-		return
+func NewServer() *Server {
+	return &Server{
+		store:       NewFileStore(),
+		rateLimiter: NewRateLimiter(),
 	}
+}
 
-	// Читаем тело
-	payload, err := io.ReadAll(io.LimitReader(r.Body, SizeMax+1))
-	if err != nil {
-		log.Printf("[PUSH] %s: read error: %v", ip, err)
-		http.Error(w, "Payload read error", http.StatusBadRequest)
-		return
+// getClientIP - retrieves client IP
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if len(parts) > 0 {
+			return strings.TrimSpace(parts[0])
+		}
 	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+	ip := r.RemoteAddr
+	if idx := strings.LastIndex(ip, ":"); idx != -1 {
+		ip = ip[:idx]
+	}
+	return ip
+}
 
-	if len(payload) != int(r.ContentLength) {
-		log.Printf("[PUSH] %s: size mismatch", ip)
-		http.Error(w, "Payload size mismatch", http.StatusBadRequest)
+// generateFileHash - generates a hash for a file
+func generateFileHash(data []byte) string {
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:])
+}
+
+// UploadHandler - POST /file-api/upload
+func (s *Server) UploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	// Rate limiting
+	ip := getClientIP(r)
 	if !s.rateLimiter.Allow(ip) {
-		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		http.Error(w, "Too many requests", http.StatusTooManyRequests)
 		return
 	}
 
-	// Сохраняем в БД
-	size := len(payload)
-	if err := s.db.SavePackage(targetHash, payload, size); err != nil {
-		if err.Error() == "queue full" {
-			http.Error(w, "Queue full", http.StatusTooManyRequests)
+	// Check Content-Length
+	if r.ContentLength <= 0 {
+		http.Error(w, "Missing Content-Length", http.StatusLengthRequired)
+		return
+	}
+
+	if r.ContentLength > DiskLimit {
+		log.Printf("REJECTED: file too large (%d bytes) from %s", r.ContentLength, ip)
+		http.Error(w, fmt.Sprintf("File too large: max %d bytes", DiskLimit),
+			http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Read the request body with a limit
+	var buf bytes.Buffer
+	written, err := io.CopyN(&buf, r.Body, DiskLimit+1)
+	if err != nil && err != io.EOF {
+		log.Printf("ERROR: read failed from %s: %v", ip, err)
+		http.Error(w, "Failed to read file", http.StatusBadRequest)
+		return
+	}
+
+	if written != r.ContentLength {
+		log.Printf("REJECTED: size mismatch (expected %d, got %d) from %s",
+			r.ContentLength, written, ip)
+		http.Error(w, "Size mismatch", http.StatusBadRequest)
+		return
+	}
+
+	data := buf.Bytes()
+	fileHash := generateFileHash(data)
+
+	// Save depending on size
+	if len(data) <= RAMLimit {
+		if err := s.store.SaveToRAM(fileHash, data); err != nil {
+			log.Printf("ERROR: RAM save failed: %v", err)
+			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
 		}
-		log.Printf("[PUSH] %s: db error: %v", ip, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		log.Printf("UPLOADED: %d bytes to RAM (hash: %s) from %s",
+			len(data), fileHash[:8], ip)
+	} else {
+		reader := bytes.NewReader(data)
+		if err := s.store.SaveToDisk(fileHash, reader, int64(len(data))); err != nil {
+			log.Printf("ERROR: Disk save failed: %v", err)
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+		log.Printf("UPLOADED: %d bytes to DISK (hash: %s) from %s",
+			len(data), fileHash[:8], ip)
+	}
+
+	// Return the hash to the client
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fileHash))
+}
+
+// DownloadHandler - GET /file-api/download/{hash}
+func (s *Server) DownloadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	log.Printf("[PUSH] %s: ACCEPTED %d bytes to bucket %s", ip, size, targetHash[:16])
+	// Rate limiting
+	ip := getClientIP(r)
+	if !s.rateLimiter.Allow(ip) {
+		http.Error(w, "Too many requests", http.StatusTooManyRequests)
+		return
+	}
+
+	// Extract the hash from the path (proxy maps /file-api/download/xxx to /download/xxx)
+	path := r.URL.Path
+	hash := strings.TrimPrefix(path, "/download/")
+	if hash == "" || hash == path {
+		http.Error(w, "Missing file hash", http.StatusBadRequest)
+		return
+	}
+
+	// Get the file
+	entry, err := s.store.Get(hash)
+	if err != nil {
+		log.Printf("NOT FOUND: hash %s from %s", hash[:8], ip)
+		http.Error(w, "File not found", http.StatusNotFound)
+		return
+	}
+
+	var data []byte
+
+	if entry.IsDisk {
+		// Read from disk
+		data, err = os.ReadFile(entry.FilePath)
+		if err != nil {
+			log.Printf("ERROR: read disk file failed: %v", err)
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// Serve from memory
+		data = entry.Data
+	}
+
+	// Delete the file after delivery (one-time download)
+	go s.store.Delete(hash)
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+
+	log.Printf("DOWNLOADED: %d bytes (hash: %s) to %s", len(data), hash[:8], ip)
+}
+
+// InfoHandler - HEAD /file-api/info/{hash} - liveness check
+func (s *Server) InfoHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodHead && r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	path := r.URL.Path
+	hash := strings.TrimPrefix(path, "/info/")
+	if hash == "" || hash == path {
+		http.Error(w, "Missing file hash", http.StatusBadRequest)
+		return
+	}
+
+	s.store.mu.RLock()
+	entry, exists := s.store.files[hash]
+	s.store.mu.RUnlock()
+
+	if !exists {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", entry.Size))
+	w.Header().Set("X-File-Storage", map[bool]string{true: "disk", false: "ram"}[entry.IsDisk])
 	w.WriteHeader(http.StatusOK)
 }
 
-// handlePull — GET /pull/{target_hash}
-func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
-	targetHash := r.PathValue("target_hash")
-	ip := getClientIP(r)
-
-	// Читаем заголовки авторизации
-	identityKey := r.Header.Get("X-Identity-Key")
-	timestamp := r.Header.Get("X-Timestamp")
-	signature := r.Header.Get("X-Signature")
-
-	// Проверка авторизации
-	if err := verifyAuth(identityKey, timestamp, signature, targetHash); err != nil {
-		log.Printf("[PULL] %s: auth failed: %v", ip, err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// Rate limiting
-	if !s.rateLimiter.Allow(ip) {
-		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
-		return
-	}
-
-	// Забираем пакеты из БД
-	payloads, sizes, err := s.db.PullPackages(targetHash)
-	if err != nil {
-		log.Printf("[PULL] %s: db error: %v", ip, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	// Если нет пакетов — 204 No Content
-	if len(payloads) == 0 {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	// Формируем multipart ответ
-	writer := multipart.NewWriter(w)
-	w.Header().Set("Content-Type", writer.FormDataContentType())
-
-	for i, payload := range payloads {
-		part, err := writer.CreateFormFile(
-			fmt.Sprintf("package_%d", i),
-			fmt.Sprintf("package_%d_size_%d.bin", i, sizes[i]),
-		)
-		if err != nil {
-			log.Printf("[PULL] %s: multipart error: %v", ip, err)
-			http.Error(w, "Response formatting error", http.StatusInternalServerError)
-			return
-		}
-		if _, err := part.Write(payload); err != nil {
-			log.Printf("[PULL] %s: write part error: %v", ip, err)
-			return
-		}
-	}
-
-	if err := writer.Close(); err != nil {
-		log.Printf("[PULL] %s: close multipart error: %v", ip, err)
-	}
-
-	log.Printf("[PULL] %s: DELIVERED %d packages to bucket %s",
-		ip, len(payloads), targetHash[:16],
-	)
-}
-
-// handlePing — проверка здоровья сервера
-func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
+// PingHandler - liveness check
+func (s *Server) PingHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("pong"))
 }
 
-// --- Вспомогательные функции ---
+// startCleanupWorker - background cleaning
+func (s *Server) startCleanupWorker(ctx context.Context) {
+	ticker := time.NewTicker(CleanupInterval)
+	defer ticker.Stop()
 
-func getClientIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
+	// First cleaning a minute after start
+	time.Sleep(1 * time.Minute)
+
+	for {
+		select {
+		case <-ticker.C:
+			removed := s.store.Cleanup()
+			if removed > 0 {
+				log.Printf("CLEANUP: removed %d files", removed)
+			}
+			s.rateLimiter.Cleanup()
+		case <-ctx.Done():
+			return
+		}
 	}
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		return ip
-	}
-	return r.RemoteAddr
 }
 
-// --- Main ---
-
 func main() {
-	// Инициализация БД в памяти
-	db, err := NewDB()
-	if err != nil {
-		log.Fatalf("Failed to init database: %v", err)
-	}
-	defer db.Close()
-
-	// Сервер
-	server := &Server{
-		db:          db,
-		rateLimiter: NewRateLimiter(),
+	// --- Environment Variables Initialization ---
+	// Fetching values from .env (passed via Docker)
+	envVaultPath := os.Getenv("VAULT_PATH")
+	if envVaultPath == "" {
+		envVaultPath = "/var/lib/lastchance/vault" // Safe fallback
 	}
 
-	// Роутинг
+	// --- Directory Setup ---
+	// Create vault directory if it doesn't exist
+	if err := os.MkdirAll(envVaultPath, 0700); err != nil {
+		log.Fatalf("FAILED: Could not create vault directory [%s]: %v", envVaultPath, err)
+	}
+
+	// --- Startup Cleanup ---
+	// Purge stale data from previous sessions
+	log.Printf("STARTUP: Purging old data in %s", envVaultPath)
+	cleanupPatterns := []string{"*.bin", "*.tmp"}
+	for _, pattern := range cleanupPatterns {
+		files, _ := filepath.Glob(filepath.Join(envVaultPath, pattern))
+		for _, f := range files {
+			os.Remove(f)
+		}
+	}
+
+	server := NewServer()
+
+	// --- Router Configuration ---
+	// Note: Caddy proxies /file-api/* to these internal endpoints
 	mux := http.NewServeMux()
-	// main.go серверного нода — меняем только роутинг
-	mux.HandleFunc("POST /api-v1/push/{target_hash}", server.handlePush)
-	mux.HandleFunc("GET /api-v1/pull/{target_hash}", server.handlePull)
-	mux.HandleFunc("GET /api-v1/ping", server.handlePing)
+	mux.HandleFunc("POST /upload", server.UploadHandler)
+	mux.HandleFunc("GET /download/", server.DownloadHandler)
+	mux.HandleFunc("HEAD /info/", server.InfoHandler)
+	mux.HandleFunc("GET /info/", server.InfoHandler)
+	mux.HandleFunc("GET /ping", server.PingHandler)
 
-	httpSrv := &http.Server{
-		Addr:         ":8080",
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+	httpServer := &http.Server{
+		Addr:           ":8081", // Internal port for Docker network
+		Handler:        mux,
+		ReadTimeout:    60 * time.Second,  // Increased for large file uploads
+		WriteTimeout:   120 * time.Second, // Increased for downloads
+		IdleTimeout:    180 * time.Second,
+		MaxHeaderBytes: 1 << 12,
 	}
 
-	// Контекст для graceful shutdown
-	ctx, cancel := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
+	// --- Graceful Shutdown Setup ---
+	ctx, stop := signal.NotifyContext(context.Background(),
+		os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Launch cleanup worker to manage file TTLs
+	go server.startCleanupWorker(ctx)
+
+	// --- Server Start ---
+	go func() {
+		log.Printf("SUCCESS: File Relay Service active on :8081")
+		log.Printf("RESOURCE LIMITS: RAM: %d MB, Disk: %d MB", RAMLimit/(1024*1024), DiskLimit/(1024*1024))
+		log.Printf("STORAGE PATH: %s", envVaultPath)
+		log.Printf("TRUST MODE: Proxy-Trusted initialization - security deferred to reverse proxy")
+
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("FATAL: Server error: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Println("SHUTDOWN: Signal received, stopping services...")
+
+	// Force shutdown after 15 seconds if requests are hanging
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Фоновая очистка старых пакетов
-	go func() {
-		ticker := time.NewTicker(CleanupInterval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				removed, err := db.Cleanup(time.Now().Add(-MessageTTL))
-				if err != nil {
-					log.Printf("[CLEANUP] Error: %v", err)
-				} else if removed > 0 {
-					log.Printf("[CLEANUP] Removed %d expired packages", removed)
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	// Запуск сервера
-	log.Println("NablaShell Relay Node starting on :8080")
-	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
-		}
-	}()
-
-	// Ожидание сигнала
-	<-ctx.Done()
-	log.Println("Shutting down server...")
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-
-	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("ERROR: Shutdown failure: %v", err)
 	}
 
-	log.Println("Server stopped")
+	// --- Final Secure Cleanup ---
+	// Use 'shred' if available for secure file deletion on disk
+	log.Println("CLEANUP: Securely erasing vault files...")
+	files, _ := filepath.Glob(filepath.Join(envVaultPath, "*.bin"))
+	for _, f := range files {
+		if _, err := exec.LookPath("shred"); err == nil {
+			// 3 passes overwriting before deleting
+			exec.Command("shred", "-u", "-n", "3", f).Run()
+		} else {
+			os.Remove(f)
+		}
+	}
+
+	log.Println("EXIT: Last Chance Server stopped")
 }
