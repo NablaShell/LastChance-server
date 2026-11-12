@@ -488,7 +488,7 @@ func main() {
 		}
 	}()
 
-	log.Println("NablaShell Relay Node starting on :8080")
+	log.Println("LastChance Text Node starting on :8080")
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP server error: %v", err)
