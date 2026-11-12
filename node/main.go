@@ -16,18 +16,19 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"golang.org/x/time/rate"
+	_ "modernc.org/sqlite"
 )
 
-// --- Constants per specification ---
+// --- Protocol constants (must match the Rust client) ---
 
 const (
-	// Grid of allowed payload sizes
+	// The client accepts exactly this grid of message packet sizes.
 	SizeVeryTiny = 256
 	SizeTiny     = 1024
 	SizeSmall    = 4096
@@ -39,15 +40,15 @@ const (
 	MaxTimestampDiff   = 60 // seconds, replay protection
 )
 
-// allowedSizes — O(1) lookup map for allowed payload sizes
-var allowedSizes = map[int]bool{
+// allowedSizes — O(1) lookup for the allowed packet-size grid.
+var allowedSizes = map[int64]bool{
 	SizeVeryTiny: true,
 	SizeTiny:     true,
 	SizeSmall:    true,
 	SizeMax:      true,
 }
 
-// ErrQueueFull is returned when the queue for a target hash is full
+// ErrQueueFull is returned when the queue for a target hash is full.
 var ErrQueueFull = errors.New("queue full")
 
 // --- In-memory database ---
@@ -57,19 +58,22 @@ type DB struct {
 }
 
 func NewDB() (*DB, error) {
-	// mode=memory — pure RAM, no file
+	// :memory: is pure RAM, as required by the relay design.
 	conn, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
-	// Critical: :memory: creates a separate DB per connection.
-	// Limit the pool to a single connection so all queries see the same data.
+	// A :memory: database is per-connection. Keep a single connection so
+	// every query sees the same data.
 	conn.SetMaxOpenConns(1)
 	conn.SetMaxIdleConns(1)
-	conn.Exec("PRAGMA busy_timeout=5000;")
 
-	// Create table strictly per specification
+	if _, err := conn.Exec("PRAGMA busy_timeout=5000;"); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("set busy timeout: %w", err)
+	}
+
 	query := `
 	CREATE TABLE IF NOT EXISTS queue (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,40 +86,36 @@ func NewDB() (*DB, error) {
 	CREATE INDEX IF NOT EXISTS idx_created_at ON queue(created_at);
 	`
 	if _, err := conn.Exec(query); err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
 	return &DB{conn: conn}, nil
 }
 
-// SavePackage stores a package in the recipient's queue
+// SavePackage stores a package in the recipient's queue.
 func (db *DB) SavePackage(targetHash string, payload []byte, size int) error {
-	// Check queue limit for this hash
 	var count int
-	err := db.conn.QueryRow(
+	if err := db.conn.QueryRow(
 		"SELECT COUNT(*) FROM queue WHERE target_hash = ?",
 		targetHash,
-	).Scan(&count)
-	if err != nil {
+	).Scan(&count); err != nil {
 		return fmt.Errorf("count queue: %w", err)
 	}
 	if count >= MaxMessagesPerHash {
 		return ErrQueueFull
 	}
 
-	// Insert the package
-	_, err = db.conn.Exec(
+	if _, err := db.conn.Exec(
 		"INSERT INTO queue (target_hash, payload, size, created_at) VALUES (?, ?, ?, ?)",
 		targetHash, payload, size, time.Now().Unix(),
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("insert package: %w", err)
 	}
 	return nil
 }
 
-// PullPackages atomically fetches and deletes packages for a hash.
-// Returns a slice of payloads and their sizes.
+// PullPackages atomically fetches and deletes all packages for a hash.
 func (db *DB) PullPackages(targetHash string) ([][]byte, []int, error) {
 	tx, err := db.conn.Begin()
 	if err != nil {
@@ -123,7 +123,6 @@ func (db *DB) PullPackages(targetHash string) ([][]byte, []int, error) {
 	}
 	defer tx.Rollback()
 
-	// Read everything for this hash
 	rows, err := tx.Query(
 		"SELECT payload, size FROM queue WHERE target_hash = ? ORDER BY id ASC",
 		targetHash,
@@ -131,25 +130,26 @@ func (db *DB) PullPackages(targetHash string) ([][]byte, []int, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("select packages: %w", err)
 	}
-	defer rows.Close()
 
 	var payloads [][]byte
 	var sizes []int
-
 	for rows.Next() {
 		var payload []byte
 		var size int
 		if err := rows.Scan(&payload, &size); err != nil {
+			rows.Close()
 			return nil, nil, fmt.Errorf("scan package: %w", err)
 		}
 		payloads = append(payloads, payload)
 		sizes = append(sizes, size)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return nil, nil, fmt.Errorf("rows iteration: %w", err)
 	}
+	rows.Close()
 
-	// Delete everything for this hash
+	// Delete only after the rows have been fully read.
 	if _, err := tx.Exec(
 		"DELETE FROM queue WHERE target_hash = ?",
 		targetHash,
@@ -164,7 +164,7 @@ func (db *DB) PullPackages(targetHash string) ([][]byte, []int, error) {
 	return payloads, sizes, nil
 }
 
-// Cleanup removes old packages (older than TTL)
+// Cleanup removes old packages (older than TTL).
 func (db *DB) Cleanup(olderThan time.Time) (int64, error) {
 	result, err := db.conn.Exec(
 		"DELETE FROM queue WHERE created_at < ?",
@@ -177,16 +177,30 @@ func (db *DB) Cleanup(olderThan time.Time) (int64, error) {
 	return removed, nil
 }
 
-// Close closes the DB connection
 func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
 // --- Cryptography and authorization ---
 
-// verifyAuth validates the Ed25519 signature per specification
+// verifyAuth validates the Ed25519 signature exactly as the Rust client
+// produces it:
+//
+//	identity hash = hex(SHA256(ed25519_public_key_bytes))
+//	signed message = decimal_timestamp_string + identity_hash
+//
+// X-Identity-Key contains hex(ed25519_public_key), not the hash itself.
 func verifyAuth(identityKeyHex, timestampStr, signatureHex, targetHash string) error {
-	// 1. Timestamp check (±60 seconds)
+	identityKeyHex = strings.TrimSpace(identityKeyHex)
+	timestampStr = strings.TrimSpace(timestampStr)
+	signatureHex = strings.TrimSpace(signatureHex)
+	targetHash = strings.TrimSpace(targetHash)
+
+	if identityKeyHex == "" || timestampStr == "" || signatureHex == "" || targetHash == "" {
+		return errors.New("missing authorization headers")
+	}
+
+	// 1. Timestamp check (±60 seconds).
 	ts, err := strconv.ParseInt(timestampStr, 10, 64)
 	if err != nil {
 		return errors.New("invalid timestamp format")
@@ -200,29 +214,29 @@ func verifyAuth(identityKeyHex, timestampStr, signatureHex, targetHash string) e
 		return errors.New("timestamp expired")
 	}
 
-	// 2. Decode public key from hex
+	// 2. Decode the Ed25519 public key from hex.
 	pubKey, err := hex.DecodeString(identityKeyHex)
 	if err != nil || len(pubKey) != ed25519.PublicKeySize {
 		return errors.New("invalid public key format")
 	}
 
-	// 3. Verify hash match (constant-time to avoid timing attacks)
+	// 3. The URL target hash must be SHA256 of the raw Ed25519 public key.
 	hash := sha256.Sum256(pubKey)
 	computedHash := hex.EncodeToString(hash[:])
 	if subtle.ConstantTimeCompare([]byte(computedHash), []byte(targetHash)) != 1 {
 		return errors.New("identity key does not match target hash")
 	}
 
-	// 4. Build message: timestamp + identity_hash
-	message := fmt.Sprintf("%s%s", timestampStr, targetHash)
+	// 4. Signed message: timestamp + identity_hash with no separator.
+	message := timestampStr + targetHash
 
-	// 5. Decode signature
+	// 5. Decode the signature.
 	signature, err := hex.DecodeString(signatureHex)
 	if err != nil || len(signature) != ed25519.SignatureSize {
 		return errors.New("invalid signature format")
 	}
 
-	// 6. Verify Ed25519 signature
+	// 6. Verify the Ed25519 signature.
 	if !ed25519.Verify(pubKey, []byte(message), signature) {
 		return errors.New("signature verification failed")
 	}
@@ -230,7 +244,7 @@ func verifyAuth(identityKeyHex, timestampStr, signatureHex, targetHash string) e
 	return nil
 }
 
-// --- Rate Limiter ---
+// --- Rate limiter ---
 
 type RateLimiter struct {
 	mu       sync.Mutex
@@ -249,21 +263,20 @@ func (rl *RateLimiter) Allow(ip string) bool {
 
 	l, exists := rl.limiters[ip]
 	if !exists {
-		// 5 requests per second with burst of 10
+		// 5 requests per second with a burst of 10.
 		l = rate.NewLimiter(rate.Limit(5), 10)
 		rl.limiters[ip] = l
 	}
 	return l.Allow()
 }
 
-// Cleanup removes stale limiters (currently a no-op, reserved for future use)
 func (rl *RateLimiter) Cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	// TODO: track last-seen timestamps per IP and drop idle entries.
+	// Reserved for future idle-limiter tracking.
 }
 
-// --- HTTP Server ---
+// --- HTTP server ---
 
 type Server struct {
 	db          *DB
@@ -272,46 +285,40 @@ type Server struct {
 
 // handlePush — POST /api-v1/push/{target_hash}
 func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
-	targetHash := r.PathValue("target_hash")
+	targetHash := strings.TrimSpace(r.PathValue("target_hash"))
 	ip := getClientIP(r)
 
-	// Reject requests without a known Content-Length (e.g. chunked encoding)
+	// The Rust client always sends Content-Length and a packet from the
+	// fixed size grid.
 	if r.ContentLength < 0 {
 		log.Printf("[PUSH] %s: unknown Content-Length", ip)
 		http.Error(w, "Invalid Payload Size", http.StatusBadRequest)
 		return
 	}
-
-	// Validate size against the grid
-	if !allowedSizes[int(r.ContentLength)] {
+	if !allowedSizes[r.ContentLength] {
 		log.Printf("[PUSH] %s: invalid size %d", ip, r.ContentLength)
 		http.Error(w, "Invalid Payload Size", http.StatusBadRequest)
 		return
 	}
 
-	// Read body
 	payload, err := io.ReadAll(io.LimitReader(r.Body, SizeMax+1))
 	if err != nil {
 		log.Printf("[PUSH] %s: read error: %v", ip, err)
 		http.Error(w, "Payload read error", http.StatusBadRequest)
 		return
 	}
-
-	if len(payload) != int(r.ContentLength) {
+	if int64(len(payload)) != r.ContentLength {
 		log.Printf("[PUSH] %s: size mismatch", ip)
 		http.Error(w, "Payload size mismatch", http.StatusBadRequest)
 		return
 	}
 
-	// Rate limiting
 	if !s.rateLimiter.Allow(ip) {
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 		return
 	}
 
-	// Save to DB
-	size := len(payload)
-	if err := s.db.SavePackage(targetHash, payload, size); err != nil {
+	if err := s.db.SavePackage(targetHash, payload, len(payload)); err != nil {
 		if errors.Is(err, ErrQueueFull) {
 			http.Error(w, "Queue full", http.StatusTooManyRequests)
 			return
@@ -321,34 +328,35 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[PUSH] %s: ACCEPTED %d bytes to bucket %s", ip, size, shortHash(targetHash))
+	log.Printf("[PUSH] %s: ACCEPTED %d bytes to bucket %s", ip, len(payload), shortHash(targetHash))
 	w.WriteHeader(http.StatusOK)
 }
 
 // handlePull — GET /api-v1/pull/{target_hash}
 func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
-	targetHash := r.PathValue("target_hash")
+	targetHash := strings.TrimSpace(r.PathValue("target_hash"))
 	ip := getClientIP(r)
 
-	// Read authorization headers
+	// The Rust client (and the current Go client) uses X-Identity-Key.
+	// X-Public-Key is accepted as an alias for documentation-era clients.
 	identityKey := r.Header.Get("X-Identity-Key")
+	if identityKey == "" {
+		identityKey = r.Header.Get("X-Public-Key")
+	}
 	timestamp := r.Header.Get("X-Timestamp")
 	signature := r.Header.Get("X-Signature")
 
-	// Verify authorization
 	if err := verifyAuth(identityKey, timestamp, signature, targetHash); err != nil {
 		log.Printf("[PULL] %s: auth failed: %v", ip, err)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	// Rate limiting
 	if !s.rateLimiter.Allow(ip) {
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 		return
 	}
 
-	// Fetch packages from DB
 	payloads, sizes, err := s.db.PullPackages(targetHash)
 	if err != nil {
 		log.Printf("[PULL] %s: db error: %v", ip, err)
@@ -356,13 +364,14 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// No packages — 204 No Content
+	// No packages — the client expects 204 No Content.
 	if len(payloads) == 0 {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Build multipart response
+	// Build a multipart response. The Rust client only extracts the raw
+	// payload of each part, so any valid multipart/form-data layout works.
 	writer := multipart.NewWriter(w)
 	w.Header().Set("Content-Type", writer.FormDataContentType())
 
@@ -372,7 +381,6 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("package_%d_size_%d.bin", i, sizes[i]),
 		)
 		if err != nil {
-			// Headers may already be sent; log and abort without writing an HTTP error.
 			log.Printf("[PULL] %s: multipart error: %v", ip, err)
 			return
 		}
@@ -384,6 +392,7 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 
 	if err := writer.Close(); err != nil {
 		log.Printf("[PULL] %s: close multipart error: %v", ip, err)
+		return
 	}
 
 	log.Printf("[PULL] %s: DELIVERED %d packages to bucket %s",
@@ -391,9 +400,9 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// handlePing — server health check
+// handlePing — health check.
 func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("pong"))
+	_, _ = w.Write([]byte("pong"))
 }
 
 // --- Helpers ---
@@ -403,12 +412,15 @@ func getClientIP(r *http.Request) string {
 		return ip
 	}
 	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		return ip
+		if idx := strings.IndexByte(ip, ','); idx >= 0 {
+			ip = ip[:idx]
+		}
+		return strings.TrimSpace(ip)
 	}
 	return r.RemoteAddr
 }
 
-// shortHash safely truncates a hash for logging
+// shortHash safely truncates a hash for logging.
 func shortHash(h string) string {
 	if len(h) > 16 {
 		return h[:16]
@@ -419,24 +431,28 @@ func shortHash(h string) string {
 // --- Main ---
 
 func main() {
-	// Initialize in-memory DB
 	db, err := NewDB()
 	if err != nil {
 		log.Fatalf("Failed to init database: %v", err)
 	}
 	defer db.Close()
 
-	// Server
 	server := &Server{
 		db:          db,
 		rateLimiter: NewRateLimiter(),
 	}
 
-	// Routing
 	mux := http.NewServeMux()
+
+	// Public routes used through Caddy (/api-v1/* is forwarded as-is).
 	mux.HandleFunc("POST /api-v1/push/{target_hash}", server.handlePush)
 	mux.HandleFunc("GET /api-v1/pull/{target_hash}", server.handlePull)
 	mux.HandleFunc("GET /api-v1/ping", server.handlePing)
+
+	// Direct/internal aliases, useful for testing and non-proxied clients.
+	mux.HandleFunc("POST /push/{target_hash}", server.handlePush)
+	mux.HandleFunc("GET /pull/{target_hash}", server.handlePull)
+	mux.HandleFunc("GET /ping", server.handlePing)
 
 	httpSrv := &http.Server{
 		Addr:         ":8080",
@@ -446,7 +462,6 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// Context for graceful shutdown
 	ctx, cancel := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -454,7 +469,6 @@ func main() {
 	)
 	defer cancel()
 
-	// Background cleanup of expired packages
 	go func() {
 		ticker := time.NewTicker(CleanupInterval)
 		defer ticker.Stop()
@@ -474,7 +488,6 @@ func main() {
 		}
 	}()
 
-	// Start server
 	log.Println("NablaShell Relay Node starting on :8080")
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -482,7 +495,6 @@ func main() {
 		}
 	}()
 
-	// Wait for signal
 	<-ctx.Done()
 	log.Println("Shutting down server...")
 
