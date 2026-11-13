@@ -38,6 +38,12 @@ const (
 	MessageTTL         = 24 * time.Hour
 	CleanupInterval    = 10 * time.Minute
 	MaxTimestampDiff   = 60 // seconds, replay protection
+
+	// MaxLongPollWait is the upper bound for ?wait=N on GET /pull.
+	MaxLongPollWait = 30 * time.Second
+	// ServerWriteTimeout must exceed MaxLongPollWait so the HTTP server
+	// does not cut a hanging long-poll short.
+	ServerWriteTimeout = 45 * time.Second
 )
 
 // allowedSizes — O(1) lookup for the allowed packet-size grid.
@@ -276,11 +282,95 @@ func (rl *RateLimiter) Cleanup() {
 	// Reserved for future idle-limiter tracking.
 }
 
+// --- Long-poll notification registry ---
+
+// NotifyRegistry wakes up long-polling GET /pull requests when a new package
+// is written to a target bucket. It is safe for concurrent use.
+//
+// A channel is created lazily for a hash that has at least one waiter and is
+// removed once the last waiter leaves, so idle hashes do not leak memory.
+// Channels are never closed: Notify only sends non-blocking signals and a
+// removed channel is simply left for the garbage collector.
+type NotifyRegistry struct {
+	mu      sync.Mutex
+	buckets map[string]*notifyBucket
+}
+
+type notifyBucket struct {
+	ch      chan struct{}
+	waiters int
+}
+
+func NewNotifyRegistry() *NotifyRegistry {
+	return &NotifyRegistry{
+		buckets: make(map[string]*notifyBucket),
+	}
+}
+
+// Subscribe registers interest in a hash. The returned cancel function must
+// be called when the waiter stops waiting.
+func (n *NotifyRegistry) Subscribe(targetHash string) (<-chan struct{}, func()) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	b, ok := n.buckets[targetHash]
+	if !ok {
+		b = &notifyBucket{ch: make(chan struct{}, 1)}
+		n.buckets[targetHash] = b
+	}
+	b.waiters++
+
+	cancel := func() {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+
+		b.waiters--
+		if b.waiters <= 0 {
+			if cur, ok := n.buckets[targetHash]; ok && cur == b {
+				delete(n.buckets, targetHash)
+			}
+		}
+	}
+
+	return b.ch, cancel
+}
+
+// Notify performs a non-blocking wake-up signal for a hash. It is a no-op
+// when nobody is currently waiting.
+func (n *NotifyRegistry) Notify(targetHash string) {
+	n.mu.Lock()
+	b, ok := n.buckets[targetHash]
+	n.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	select {
+	case b.ch <- struct{}{}:
+	default:
+		// A signal is already pending; one wake-up is enough because waiters
+		// always re-check the bucket after waking up.
+	}
+}
+
+// Waiters reports how many pull requests are currently waiting on a hash.
+func (n *NotifyRegistry) Waiters(targetHash string) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if b, ok := n.buckets[targetHash]; ok {
+		return b.waiters
+	}
+	return 0
+}
+
 // --- HTTP server ---
 
 type Server struct {
 	db          *DB
 	rateLimiter *RateLimiter
+	notifier    *NotifyRegistry
 }
 
 // handlePush — POST /api-v1/push/{target_hash}
@@ -329,10 +419,18 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[PUSH] %s: ACCEPTED %d bytes to bucket %s", ip, len(payload), shortHash(targetHash))
+
+	// Wake up a long-polling GET /pull for this recipient, if any.
+	s.notifier.Notify(targetHash)
+
 	w.WriteHeader(http.StatusOK)
 }
 
 // handlePull — GET /api-v1/pull/{target_hash}
+//
+// Supports HTTP long-polling via ?wait=<seconds> (clamped to MaxLongPollWait).
+// With no wait (or wait=0) it keeps the legacy behaviour: return 204 No Content
+// immediately when the bucket is empty.
 func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 	targetHash := strings.TrimSpace(r.PathValue("target_hash"))
 	ip := getClientIP(r)
@@ -357,19 +455,82 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payloads, sizes, err := s.db.PullPackages(targetHash)
-	if err != nil {
-		log.Printf("[PULL] %s: db error: %v", ip, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
+	wait := parseLongPollWait(r)
+
+	// Subscribe before checking the bucket: a push that lands between the
+	// check and the wait then leaves a signal in the buffered channel and the
+	// waiter still wakes up.
+	notifyCh, unsubscribe := s.notifier.Subscribe(targetHash)
+	defer unsubscribe()
+
+	var timeout <-chan time.Time
+	if wait > 0 {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		timeout = timer.C
 	}
 
-	// No packages — the client expects 204 No Content.
-	if len(payloads) == 0 {
-		w.WriteHeader(http.StatusNoContent)
-		return
+	for {
+		payloads, sizes, err := s.db.PullPackages(targetHash)
+		if err != nil {
+			log.Printf("[PULL] %s: db error: %v", ip, err)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		if len(payloads) > 0 {
+			s.writePackages(w, ip, targetHash, payloads, sizes)
+			return
+		}
+
+		// Legacy mode: no long-polling requested.
+		if wait <= 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		select {
+		case <-notifyCh:
+			// A package may have arrived. If another puller already drained
+			// the bucket this is a stale signal; just re-check and keep
+			// waiting for the remaining time.
+		case <-timeout:
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case <-r.Context().Done():
+			// The client dropped the connection (e.g. it is switching Tor
+			// circuits). Return without writing anything; the deferred
+			// unsubscribe releases the registry entry.
+			log.Printf("[PULL] %s: client disconnected while waiting for bucket %s",
+				ip, shortHash(targetHash),
+			)
+			return
+		}
+	}
+}
+
+// parseLongPollWait parses the optional ?wait=<seconds> parameter and clamps
+// it to [0, MaxLongPollWait]. Missing or invalid values mean "do not wait".
+func parseLongPollWait(r *http.Request) time.Duration {
+	raw := strings.TrimSpace(r.URL.Query().Get("wait"))
+	if raw == "" {
+		return 0
 	}
 
+	seconds, err := strconv.Atoi(raw)
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+
+	wait := time.Duration(seconds) * time.Second
+	if wait > MaxLongPollWait {
+		return MaxLongPollWait
+	}
+	return wait
+}
+
+// writePackages sends the pulled packages as a multipart response.
+func (s *Server) writePackages(w http.ResponseWriter, ip, targetHash string, payloads [][]byte, sizes []int) {
 	// Build a multipart response. The Rust client only extracts the raw
 	// payload of each part, so any valid multipart/form-data layout works.
 	writer := multipart.NewWriter(w)
@@ -428,6 +589,23 @@ func shortHash(h string) string {
 	return h
 }
 
+// routes builds the HTTP routing table shared by main and tests.
+func (s *Server) routes() http.Handler {
+	mux := http.NewServeMux()
+
+	// Public routes used through Caddy (/api-v1/* is forwarded as-is).
+	mux.HandleFunc("POST /api-v1/push/{target_hash}", s.handlePush)
+	mux.HandleFunc("GET /api-v1/pull/{target_hash}", s.handlePull)
+	mux.HandleFunc("GET /api-v1/ping", s.handlePing)
+
+	// Direct/internal aliases, useful for testing and non-proxied clients.
+	mux.HandleFunc("POST /push/{target_hash}", s.handlePush)
+	mux.HandleFunc("GET /pull/{target_hash}", s.handlePull)
+	mux.HandleFunc("GET /ping", s.handlePing)
+
+	return mux
+}
+
 // --- Main ---
 
 func main() {
@@ -440,25 +618,16 @@ func main() {
 	server := &Server{
 		db:          db,
 		rateLimiter: NewRateLimiter(),
+		notifier:    NewNotifyRegistry(),
 	}
 
-	mux := http.NewServeMux()
-
-	// Public routes used through Caddy (/api-v1/* is forwarded as-is).
-	mux.HandleFunc("POST /api-v1/push/{target_hash}", server.handlePush)
-	mux.HandleFunc("GET /api-v1/pull/{target_hash}", server.handlePull)
-	mux.HandleFunc("GET /api-v1/ping", server.handlePing)
-
-	// Direct/internal aliases, useful for testing and non-proxied clients.
-	mux.HandleFunc("POST /push/{target_hash}", server.handlePush)
-	mux.HandleFunc("GET /pull/{target_hash}", server.handlePull)
-	mux.HandleFunc("GET /ping", server.handlePing)
+	mux := server.routes()
 
 	httpSrv := &http.Server{
 		Addr:         ":8080",
 		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: ServerWriteTimeout,
 		IdleTimeout:  60 * time.Second,
 	}
 
