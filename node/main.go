@@ -2,16 +2,14 @@ package main
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,13 +35,26 @@ const (
 	MaxMessagesPerHash = 100
 	MessageTTL         = 24 * time.Hour
 	CleanupInterval    = 10 * time.Minute
-	MaxTimestampDiff   = 60 // seconds, replay protection
 
 	// MaxLongPollWait is the upper bound for ?wait=N on GET /pull.
 	MaxLongPollWait = 30 * time.Second
 	// ServerWriteTimeout must exceed MaxLongPollWait so the HTTP server
 	// does not cut a hanging long-poll short.
 	ServerWriteTimeout = 45 * time.Second
+
+	// Rate limiter: 5 requests/second with a burst of 10 per client IP.
+	// The map is capped with oldest-entry eviction. That is safe here because
+	// dropping a bucket only grants one extra burst to one IP; it cannot enable
+	// a replay. The replay (nonce) cache is a separate structure that fails
+	// closed instead of evicting; never reuse this policy for it (see auth.go).
+	rateLimitRPS        = 5
+	rateLimitBurst      = 10
+	rateLimitIdleTTL    = 10 * time.Minute
+	rateLimitMaxEntries = 4096
+
+	// StealthRejectedBody is the uniform body for a missing or invalid stealth
+	// header. Like AuthRejectedBody it must never describe what was wrong.
+	StealthRejectedBody = "forbidden"
 )
 
 // allowedSizes — O(1) lookup for the allowed packet-size grid.
@@ -53,6 +64,13 @@ var allowedSizes = map[int64]bool{
 	SizeSmall:    true,
 	SizeMax:      true,
 }
+
+// Stealth header configured by the deployment. Caddy enforces the same pair
+// at the edge; the relay re-checks it as defence in depth.
+var (
+	effectiveHeaderName  = os.Getenv("STEALTH_HEADER_NAME")
+	effectiveHeaderValue = os.Getenv("STEALTH_HEADER_VALUE")
+)
 
 // ErrQueueFull is returned when the queue for a target hash is full.
 var ErrQueueFull = errors.New("queue full")
@@ -187,79 +205,21 @@ func (db *DB) Close() error {
 	return db.conn.Close()
 }
 
-// --- Cryptography and authorization ---
-
-// verifyAuth validates the Ed25519 signature exactly as the Rust client
-// produces it:
-//
-//	identity hash = hex(SHA256(ed25519_public_key_bytes))
-//	signed message = decimal_timestamp_string + identity_hash
-//
-// X-Identity-Key contains hex(ed25519_public_key), not the hash itself.
-func verifyAuth(identityKeyHex, timestampStr, signatureHex, targetHash string) error {
-	identityKeyHex = strings.TrimSpace(identityKeyHex)
-	timestampStr = strings.TrimSpace(timestampStr)
-	signatureHex = strings.TrimSpace(signatureHex)
-	targetHash = strings.TrimSpace(targetHash)
-
-	if identityKeyHex == "" || timestampStr == "" || signatureHex == "" || targetHash == "" {
-		return errors.New("missing authorization headers")
-	}
-
-	// 1. Timestamp check (±60 seconds).
-	ts, err := strconv.ParseInt(timestampStr, 10, 64)
-	if err != nil {
-		return errors.New("invalid timestamp format")
-	}
-	now := time.Now().Unix()
-	diff := now - ts
-	if diff < 0 {
-		diff = -diff
-	}
-	if diff > MaxTimestampDiff {
-		return errors.New("timestamp expired")
-	}
-
-	// 2. Decode the Ed25519 public key from hex.
-	pubKey, err := hex.DecodeString(identityKeyHex)
-	if err != nil || len(pubKey) != ed25519.PublicKeySize {
-		return errors.New("invalid public key format")
-	}
-
-	// 3. The URL target hash must be SHA256 of the raw Ed25519 public key.
-	hash := sha256.Sum256(pubKey)
-	computedHash := hex.EncodeToString(hash[:])
-	if subtle.ConstantTimeCompare([]byte(computedHash), []byte(targetHash)) != 1 {
-		return errors.New("identity key does not match target hash")
-	}
-
-	// 4. Signed message: timestamp + identity_hash with no separator.
-	message := timestampStr + targetHash
-
-	// 5. Decode the signature.
-	signature, err := hex.DecodeString(signatureHex)
-	if err != nil || len(signature) != ed25519.SignatureSize {
-		return errors.New("invalid signature format")
-	}
-
-	// 6. Verify the Ed25519 signature.
-	if !ed25519.Verify(pubKey, []byte(message), signature) {
-		return errors.New("signature verification failed")
-	}
-
-	return nil
-}
-
 // --- Rate limiter ---
+
+type rateEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
 
 type RateLimiter struct {
 	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
+	limiters map[string]*rateEntry
 }
 
 func NewRateLimiter() *RateLimiter {
 	return &RateLimiter{
-		limiters: make(map[string]*rate.Limiter),
+		limiters: make(map[string]*rateEntry),
 	}
 }
 
@@ -267,19 +227,54 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	l, exists := rl.limiters[ip]
+	entry, exists := rl.limiters[ip]
 	if !exists {
-		// 5 requests per second with a burst of 10.
-		l = rate.NewLimiter(rate.Limit(5), 10)
-		rl.limiters[ip] = l
+		if len(rl.limiters) >= rateLimitMaxEntries {
+			rl.evictOldestLocked()
+		}
+		entry = &rateEntry{limiter: rate.NewLimiter(rateLimitRPS, rateLimitBurst)}
+		rl.limiters[ip] = entry
 	}
-	return l.Allow()
+	entry.lastSeen = time.Now()
+	return entry.limiter.Allow()
 }
 
+// Cleanup drops buckets that have not seen traffic for rateLimitIdleTTL. It
+// does not reset active buckets, so a cleanup tick can never hand an attacker
+// a fresh burst.
 func (rl *RateLimiter) Cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	// Reserved for future idle-limiter tracking.
+
+	cutoff := time.Now().Add(-rateLimitIdleTTL)
+	for ip, entry := range rl.limiters {
+		if entry.lastSeen.Before(cutoff) {
+			delete(rl.limiters, ip)
+		}
+	}
+}
+
+// evictOldestLocked drops the least-recently-seen bucket when the map is full.
+// Eviction only resets a rate limit for one IP; replay protection lives in the
+// separate nonce cache, which fails closed instead (auth.go).
+func (rl *RateLimiter) evictOldestLocked() {
+	var oldestIP string
+	var oldest time.Time
+	for ip, entry := range rl.limiters {
+		if oldestIP == "" || entry.lastSeen.Before(oldest) {
+			oldestIP = ip
+			oldest = entry.lastSeen
+		}
+	}
+	if oldestIP != "" {
+		delete(rl.limiters, oldestIP)
+	}
+}
+
+func (rl *RateLimiter) Len() int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return len(rl.limiters)
 }
 
 // --- Long-poll notification registry ---
@@ -371,12 +366,19 @@ type Server struct {
 	db          *DB
 	rateLimiter *RateLimiter
 	notifier    *NotifyRegistry
+	auth        *AuthVerifier
 }
 
 // handlePush — POST /api-v1/push/{target_hash}
 func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 	targetHash := strings.TrimSpace(r.PathValue("target_hash"))
 	ip := getClientIP(r)
+
+	if !checkGuard(r) {
+		log.Printf("[PUSH] %s: missing stealth header", ip)
+		http.Error(w, StealthRejectedBody, http.StatusForbidden)
+		return
+	}
 
 	// The Rust client always sends Content-Length and a packet from the
 	// fixed size grid.
@@ -408,6 +410,13 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// H-4: /push carries the same canonical signature as /pull, with
+	// body_hash = SHA256(packet) bound into the envelope.
+	if err := s.auth.VerifyRequest(r, payload, "/api-v1"); err != nil {
+		writeAuthError(w, err)
+		return
+	}
+
 	if err := s.db.SavePackage(targetHash, payload, len(payload)); err != nil {
 		if errors.Is(err, ErrQueueFull) {
 			http.Error(w, "Queue full", http.StatusTooManyRequests)
@@ -435,23 +444,28 @@ func (s *Server) handlePull(w http.ResponseWriter, r *http.Request) {
 	targetHash := strings.TrimSpace(r.PathValue("target_hash"))
 	ip := getClientIP(r)
 
-	// The Rust client (and the current Go client) uses X-Identity-Key.
-	// X-Public-Key is accepted as an alias for documentation-era clients.
-	identityKey := r.Header.Get("X-Identity-Key")
-	if identityKey == "" {
-		identityKey = r.Header.Get("X-Public-Key")
-	}
-	timestamp := r.Header.Get("X-Timestamp")
-	signature := r.Header.Get("X-Signature")
-
-	if err := verifyAuth(identityKey, timestamp, signature, targetHash); err != nil {
-		log.Printf("[PULL] %s: auth failed: %v", ip, err)
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	if !checkGuard(r) {
+		log.Printf("[PULL] %s: missing stealth header", ip)
+		http.Error(w, StealthRejectedBody, http.StatusForbidden)
 		return
 	}
 
+	// Rate-limit before touching the replay cache: a 429 must not consume the
+	// client's nonce, otherwise its retry would look like a replay.
 	if !s.rateLimiter.Allow(ip) {
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+
+	// The release client signs the whole request and sends the recipient
+	// identity both in the URL and in X-Auth-Identity.
+	if err := s.auth.VerifyRequest(r, nil, "/api-v1"); err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	if !equalFoldConstantTime(strings.TrimSpace(r.Header.Get(HeaderIdentity)), targetHash) {
+		log.Printf("[PULL] %s: identity does not match target bucket %s", ip, shortHash(targetHash))
+		http.Error(w, AuthRejectedBody, http.StatusUnauthorized)
 		return
 	}
 
@@ -569,16 +583,113 @@ func (s *Server) handlePing(w http.ResponseWriter, r *http.Request) {
 // --- Helpers ---
 
 func getClientIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
+	host := remoteHost(r)
+
+	// Only a peer on loopback or a private network can be the Caddy proxy.
+	// Anything else is a direct client, and its forwarding headers are
+	// attacker-controlled (K3: rate-limit evasion via a forged X-Real-IP).
+	if !isTrustedProxy(host) {
+		return host
 	}
-	if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
-		if idx := strings.IndexByte(ip, ','); idx >= 0 {
-			ip = ip[:idx]
+
+	// Caddy overwrites X-Real-IP with header_up, so this value is never the
+	// one supplied by the client. X-Forwarded-For is deliberately ignored:
+	// one canonical header is easier to reason about and to test.
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		if ip := net.ParseIP(xri); ip != nil {
+			return ip.String()
 		}
-		return strings.TrimSpace(ip)
 	}
-	return r.RemoteAddr
+	return host
+}
+
+// remoteHost returns the peer address without the ephemeral port. Unlike a
+// LastIndex(":") split it also handles IPv6 literals correctly.
+func remoteHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return strings.Trim(r.RemoteAddr, "[]")
+	}
+	return host
+}
+
+// trustedProxyNets is the parsed TRUSTED_PROXY_CIDR allow-list. A nil slice
+// means the variable is unset, in which case isTrustedProxy keeps the legacy
+// loopback/RFC1918/ULA behaviour for backward compatibility.
+var trustedProxyNets []*net.IPNet
+
+// loadTrustedProxies parses a comma- or whitespace-separated list of CIDRs or
+// bare IPs. An empty spec returns (nil, nil), meaning "use the default".
+func loadTrustedProxies(spec string) ([]*net.IPNet, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, nil
+	}
+
+	fields := strings.FieldsFunc(spec, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+
+	nets := make([]*net.IPNet, 0, len(fields))
+	for _, field := range fields {
+		if strings.Contains(field, "/") {
+			_, network, err := net.ParseCIDR(field)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", field, err)
+			}
+			nets = append(nets, network)
+			continue
+		}
+
+		ip := net.ParseIP(field)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP %q", field)
+		}
+		bits := 128
+		if ip.To4() != nil {
+			bits = 32
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+
+	if len(nets) == 0 {
+		return nil, fmt.Errorf("no valid CIDR or IP in %q", spec)
+	}
+	return nets, nil
+}
+
+// isTrustedProxy reports whether host may supply proxy headers. The relays
+// are only reachable through Caddy on the internal Docker bridge, so loopback
+// and RFC1918/ULA peers are the only legitimate proxies by default.
+//
+// Set TRUSTED_PROXY_CIDR to Caddy's address or bridge subnet to stop trusting
+// every private peer: otherwise any other host on the same RFC1918 network
+// could forge X-Real-IP.
+func isTrustedProxy(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if trustedProxyNets == nil {
+		return ip.IsLoopback() || ip.IsPrivate()
+	}
+	for _, network := range trustedProxyNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// checkGuard checks the secret stealth header. Caddy already enforces it,
+// but the relay re-checks it so a container that can reach the backend
+// directly cannot bypass the proxy layer.
+func checkGuard(r *http.Request) bool {
+	if effectiveHeaderName == "" || effectiveHeaderValue == "" {
+		return false
+	}
+	got := r.Header.Get(effectiveHeaderName)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(effectiveHeaderValue)) == 1
 }
 
 // shortHash safely truncates a hash for logging.
@@ -609,6 +720,16 @@ func (s *Server) routes() http.Handler {
 // --- Main ---
 
 func main() {
+	nets, err := loadTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDR"))
+	if err != nil {
+		log.Fatalf("Invalid TRUSTED_PROXY_CIDR: %v", err)
+	}
+	trustedProxyNets = nets
+	if nets == nil {
+		log.Printf("TRUSTED_PROXY_CIDR is not set: trusting every loopback/RFC1918/ULA peer as a proxy. " +
+			"Set it to Caddy's address or bridge subnet to narrow this.")
+	}
+
 	db, err := NewDB()
 	if err != nil {
 		log.Fatalf("Failed to init database: %v", err)
@@ -619,6 +740,7 @@ func main() {
 		db:          db,
 		rateLimiter: NewRateLimiter(),
 		notifier:    NewNotifyRegistry(),
+		auth:        NewAuthVerifier(),
 	}
 
 	mux := server.routes()
@@ -651,6 +773,8 @@ func main() {
 				} else if removed > 0 {
 					log.Printf("[CLEANUP] Removed %d expired packages", removed)
 				}
+				server.rateLimiter.Cleanup()
+				server.auth.PurgeExpired()
 			case <-ctx.Done():
 				return
 			}

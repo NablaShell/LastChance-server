@@ -31,3 +31,9 @@ node_modules/
 
 # --- Logs & Context ---
 *.log
+
+# --- Compiled relay binaries ---
+node/server-node
+node/relay-node
+file_api/relay-file-node
+file_api/p2p_messenger_go_server_file

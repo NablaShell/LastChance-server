@@ -1,55 +1,103 @@
+# Every {$VAR} below must be set. Caddy expands a missing variable to an empty
+# string, and an empty argument makes this file fail to parse (for example
+# `email` with no address). Validate with the same environment you deploy with:
+#
+#     caddy validate --config Caddyfile --adapter caddyfile --envfile .env
+#
+# or, without a .env, use the template:
+#
+#     caddy validate --config Caddyfile --adapter caddyfile --envfile env.example
 {
-    email {$ACME_EMAIL}
-    admin off
-    auto_https disable_redirects
+	email {$ACME_EMAIL}
+	admin off
+	auto_https disable_redirects
 }
 
 {$DOMAIN} {
-    tls {
-        protocols tls1.3
-    }
+	tls {
+		protocols tls1.3
+	}
 
-    # Anti-Scanning Stealth Layer
-    @stealth {
-        header {$STEALTH_HEADER_NAME} {$STEALTH_HEADER_VALUE}
-    }
+	# Anti-Scanning Stealth Layer
+	@stealth {
+		header {$STEALTH_HEADER_NAME} {$STEALTH_HEADER_VALUE}
+	}
 
-    handle @stealth {
-        # Core Message Relay API
-        handle /api-v1/* {
-            reverse_proxy sms-relay:8080
-        }
+	handle @stealth {
+		# Core Message Relay API
+		handle /api-v1/* {
+			request_body {
+				# A text packet is at most 64 KiB; 1 MiB leaves room for the
+				# auth headers and rejects oversized bodies before the
+				# backend reads them.
+				max_size 1048576
+			}
+			reverse_proxy sms-relay:8080 {
+				# K3: overwrite, never append. Caddy does not set X-Real-IP by
+				# default, and it passes unknown headers through unchanged, so
+				# a client-supplied X-Real-IP would reach the relay and let a
+				# single header evade the per-IP rate limit. {remote_host} is
+				# the TCP peer, i.e. the real client.
+				header_up X-Real-IP {remote_host}
+				# Same policy for X-Forwarded-For: set it explicitly instead
+				# of relying on Caddy's default (which depends on version and
+				# trusted_proxies). The result is a single hop, not a chain.
+				# See "Rate limiting and client identity" in README.md
+				# before placing another proxy in front of Caddy.
+				header_up X-Forwarded-For {remote_host}
+			}
+		}
 
-        # File Transfer API
-        handle /file-api/* {
-            reverse_proxy file-relay:8081 {
-                flush_interval -1
-            }
-        }
+		# File Transfer API
+		handle /file-api/* {
+			request_body {
+				# Must match DiskLimit (128 MiB) in file_api/main.go, which in
+				# turn matches crypto::FILE_MAX_ENVELOPE in the Rust client.
+				# 134217728 bytes exactly; Caddy rejects larger bodies before
+				# they reach the relay.
+				max_size 134217728
+			}
+			reverse_proxy file-relay:8081 {
+				# K3: same as above.
+				header_up X-Real-IP {remote_host}
+				header_up X-Forwarded-For {remote_host}
+				# Stream downloads without buffering them in the proxy.
+				flush_interval -1
+			}
+		}
 
-        # TODO: Admin Dashboard Section
-        # handle /admin/* {
-        #     reverse_proxy admin-panel:8082
-        # }
+		# TODO: Admin Dashboard Section
+		# handle /admin/* {
+		#     reverse_proxy admin-panel:8082
+		# }
 
-        # Default fallback for authorized requests
-        handle {
-            respond "" 404
-        }
-    }
+		# Default fallback for authorized requests
+		handle {
+			respond "" 404
+		}
+	}
 
-    # Unauthorized requests - Silent Drop
-    handle {
-        respond "" 403
-    }
+	# Unauthorized requests - Silent Drop
+	handle {
+		respond "" 403
+	}
 
-    log {
-        output file /var/log/caddy/last-chance.log
-        format json
-    }
+	# Access logging is intentionally disabled: a privacy relay must not
+	# persist client IPs and URIs by default. Caddy still logs runtime errors
+	# to stderr (docker logs). To opt in, mount a volume for /var/log/caddy
+	# and enable a size- and age-bounded log:
+	#
+	# log {
+	#     output file /var/log/caddy/access.log {
+	#         roll_size 10MiB
+	#         roll_keep 3
+	#         roll_keep_for 72h
+	#     }
+	#     format json
+	# }
 }
 
 # Block direct IP access and insecure HTTP
 http:// {
-    respond "" 403
+	respond "" 403
 }

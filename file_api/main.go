@@ -15,14 +15,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -39,7 +40,7 @@ import (
 const (
 	// Files up to RAMLimit stay in memory; larger files go to the vault.
 	RAMLimit  = 1 * 1024 * 1024   // 1 MB
-	DiskLimit = 100 * 1024 * 1024 // 100 MB — the Rust client's maximum upload
+	DiskLimit = 128 * 1024 * 1024 // 128 MiB — the Rust client's FILE_MAX_ENVELOPE
 
 	// TTL
 	RAMTTL  = 30 * time.Minute
@@ -47,6 +48,20 @@ const (
 
 	// Cleanup
 	CleanupInterval = 5 * time.Minute
+
+	// Rate limiter: 5 requests/second with a burst of 10 per client IP.
+	// The map is capped with oldest-entry eviction. That is safe here because
+	// dropping a bucket only grants one extra burst to one IP; it cannot enable
+	// a replay. The replay (nonce) cache is a separate structure that fails
+	// closed instead of evicting; never reuse this policy for it (see auth.go).
+	rateLimitRPS        = 5
+	rateLimitBurst      = 10
+	rateLimitIdleTTL    = 10 * time.Minute
+	rateLimitMaxEntries = 4096
+
+	// StealthRejectedBody is the uniform body for a missing or invalid stealth
+	// header. Like AuthRejectedBody it must never describe what was wrong.
+	StealthRejectedBody = "forbidden"
 )
 
 var (
@@ -103,38 +118,20 @@ func (fs *FileStore) SaveToRAM(fileHash string, data []byte) error {
 	return nil
 }
 
-// SaveToDisk saves a file in the vault directory.
-func (fs *FileStore) SaveToDisk(fileHash string, data []byte) error {
+// SaveTempToDisk moves an already-written, authenticated temp file into the
+// vault. The caller owns tempPath until this call returns.
+func (fs *FileStore) SaveTempToDisk(fileHash, tempPath string, size int64) error {
 	if err := os.MkdirAll(vaultPath, 0700); err != nil {
 		return fmt.Errorf("failed to create vault: %w", err)
 	}
 
-	tmpFile, err := os.CreateTemp(vaultPath, "file-*.tmp")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpName := tmpFile.Name()
-	defer os.Remove(tmpName)
-
-	if _, err := io.Copy(tmpFile, bytes.NewReader(data)); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to write file: %w", err)
-	}
-
-	if err := tmpFile.Sync(); err != nil {
-		tmpFile.Close()
-		return fmt.Errorf("failed to sync file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("failed to close file: %w", err)
-	}
-
 	finalPath := filepath.Join(vaultPath, fileHash+".bin")
-	if err := os.Rename(tmpName, finalPath); err != nil {
+	if err := os.Rename(tempPath, finalPath); err != nil {
 		return fmt.Errorf("failed to rename file: %w", err)
 	}
 	// Only the service owner may read the stored file.
 	if err := os.Chmod(finalPath, 0600); err != nil {
+		os.Remove(finalPath)
 		return fmt.Errorf("failed to chmod file: %w", err)
 	}
 
@@ -142,7 +139,7 @@ func (fs *FileStore) SaveToDisk(fileHash string, data []byte) error {
 	fs.mu.Lock()
 	fs.files[fileHash] = &FileEntry{
 		FilePath:  finalPath,
-		Size:      int64(len(data)),
+		Size:      size,
 		IsDisk:    true,
 		CreatedAt: now,
 	}
@@ -235,14 +232,19 @@ func shredPath(path string, passes int) {
 }
 
 // RateLimiter — brute-force protection.
+type rateEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
 type RateLimiter struct {
 	mu       sync.Mutex
-	limiters map[string]*rate.Limiter
+	limiters map[string]*rateEntry
 }
 
 func NewRateLimiter() *RateLimiter {
 	return &RateLimiter{
-		limiters: make(map[string]*rate.Limiter),
+		limiters: make(map[string]*rateEntry),
 	}
 }
 
@@ -250,51 +252,169 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	limiter, exists := rl.limiters[ip]
+	entry, exists := rl.limiters[ip]
 	if !exists {
-		// 5 requests per second, burst 10.
-		limiter = rate.NewLimiter(5, 10)
-		rl.limiters[ip] = limiter
+		if len(rl.limiters) >= rateLimitMaxEntries {
+			rl.evictOldestLocked()
+		}
+		entry = &rateEntry{limiter: rate.NewLimiter(rateLimitRPS, rateLimitBurst)}
+		rl.limiters[ip] = entry
 	}
-
-	return limiter.Allow()
+	entry.lastSeen = time.Now()
+	return entry.limiter.Allow()
 }
 
+// Cleanup drops buckets that have not seen traffic for rateLimitIdleTTL. The
+// old implementation replaced the whole map, which reset every bucket and
+// handed clients a fresh burst every CleanupInterval.
 func (rl *RateLimiter) Cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
-	rl.limiters = make(map[string]*rate.Limiter)
+
+	cutoff := time.Now().Add(-rateLimitIdleTTL)
+	for ip, entry := range rl.limiters {
+		if entry.lastSeen.Before(cutoff) {
+			delete(rl.limiters, ip)
+		}
+	}
+}
+
+// evictOldestLocked drops the least-recently-seen bucket when the map is full.
+// Eviction only resets a rate limit for one IP; replay protection lives in the
+// separate nonce cache, which fails closed instead (auth.go).
+func (rl *RateLimiter) evictOldestLocked() {
+	var oldestIP string
+	var oldest time.Time
+	for ip, entry := range rl.limiters {
+		if oldestIP == "" || entry.lastSeen.Before(oldest) {
+			oldestIP = ip
+			oldest = entry.lastSeen
+		}
+	}
+	if oldestIP != "" {
+		delete(rl.limiters, oldestIP)
+	}
+}
+
+func (rl *RateLimiter) Len() int {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	return len(rl.limiters)
 }
 
 // Server — file relay.
 type Server struct {
 	store       *FileStore
 	rateLimiter *RateLimiter
+	auth        *AuthVerifier
 }
 
 func NewServer() *Server {
 	return &Server{
 		store:       NewFileStore(),
 		rateLimiter: NewRateLimiter(),
+		auth:        NewAuthVerifier(),
 	}
 }
 
 // getClientIP retrieves the original client IP.
 func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 {
-			return strings.TrimSpace(parts[0])
+	host := remoteHost(r)
+
+	// Only a peer on loopback or a private network can be the Caddy proxy.
+	// Anything else is a direct client, and its forwarding headers are
+	// attacker-controlled (K3: rate-limit evasion via a forged X-Real-IP).
+	if !isTrustedProxy(host) {
+		return host
+	}
+
+	// Caddy overwrites X-Real-IP with header_up, so this value is never the
+	// one supplied by the client. X-Forwarded-For is deliberately ignored:
+	// one canonical header is easier to reason about and to test.
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		if ip := net.ParseIP(xri); ip != nil {
+			return ip.String()
 		}
 	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+	return host
+}
+
+// remoteHost returns the peer address without the ephemeral port. Unlike a
+// LastIndex(":") split it also handles IPv6 literals correctly.
+func remoteHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return strings.Trim(r.RemoteAddr, "[]")
 	}
-	ip := r.RemoteAddr
-	if idx := strings.LastIndex(ip, ":"); idx != -1 {
-		ip = ip[:idx]
+	return host
+}
+
+// trustedProxyNets is the parsed TRUSTED_PROXY_CIDR allow-list. A nil slice
+// means the variable is unset, in which case isTrustedProxy keeps the legacy
+// loopback/RFC1918/ULA behaviour for backward compatibility.
+var trustedProxyNets []*net.IPNet
+
+// loadTrustedProxies parses a comma- or whitespace-separated list of CIDRs or
+// bare IPs. An empty spec returns (nil, nil), meaning "use the default".
+func loadTrustedProxies(spec string) ([]*net.IPNet, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return nil, nil
 	}
-	return ip
+
+	fields := strings.FieldsFunc(spec, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+
+	nets := make([]*net.IPNet, 0, len(fields))
+	for _, field := range fields {
+		if strings.Contains(field, "/") {
+			_, network, err := net.ParseCIDR(field)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", field, err)
+			}
+			nets = append(nets, network)
+			continue
+		}
+
+		ip := net.ParseIP(field)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP %q", field)
+		}
+		bits := 128
+		if ip.To4() != nil {
+			bits = 32
+		}
+		nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+	}
+
+	if len(nets) == 0 {
+		return nil, fmt.Errorf("no valid CIDR or IP in %q", spec)
+	}
+	return nets, nil
+}
+
+// isTrustedProxy reports whether host may supply proxy headers. The relays
+// are only reachable through Caddy on the internal Docker bridge, so loopback
+// and RFC1918/ULA peers are the only legitimate proxies by default.
+//
+// Set TRUSTED_PROXY_CIDR to Caddy's address or bridge subnet to stop trusting
+// every private peer: otherwise any other host on the same RFC1918 network
+// could forge X-Real-IP.
+func isTrustedProxy(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if trustedProxyNets == nil {
+		return ip.IsLoopback() || ip.IsPrivate()
+	}
+	for _, network := range trustedProxyNets {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkGuard checks the secret stealth header. The Rust client sends the
@@ -303,7 +423,8 @@ func checkGuard(r *http.Request) bool {
 	if effectiveHeaderName == "" || effectiveHeaderValue == "" {
 		return false
 	}
-	return r.Header.Get(effectiveHeaderName) == effectiveHeaderValue
+	got := r.Header.Get(effectiveHeaderName)
+	return subtle.ConstantTimeCompare([]byte(got), []byte(effectiveHeaderValue)) == 1
 }
 
 // generateFileHash returns the lowercase hex SHA-256 of the stored bytes.
@@ -343,7 +464,7 @@ func (s *Server) UploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !checkGuard(r) {
 		log.Printf("REJECTED: missing guard header from %s", getClientIP(r))
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		http.Error(w, StealthRejectedBody, http.StatusForbidden)
 		return
 	}
 
@@ -369,44 +490,86 @@ func (s *Server) UploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body := http.MaxBytesReader(w, r.Body, DiskLimit+1)
-	data, err := io.ReadAll(body)
+	if err := os.MkdirAll(vaultPath, 0700); err != nil {
+		log.Printf("ERROR: create vault: %v", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Hash and spool the body in one pass. The body is never buffered in
+	// memory, so a 100 MiB upload costs one disk temp file, not 100 MiB of
+	// heap (K5).
+	tempFile, err := os.CreateTemp(vaultPath, "upload-*.tmp")
 	if err != nil {
+		log.Printf("ERROR: create temp upload: %v", err)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	tempPath := tempFile.Name()
+	defer os.Remove(tempPath)
+
+	hasher := sha256.New()
+	body := http.MaxBytesReader(w, r.Body, DiskLimit+1)
+	written, copyErr := io.Copy(io.MultiWriter(tempFile, hasher), body)
+	if copyErr == nil {
+		copyErr = tempFile.Sync()
+	}
+	closeErr := tempFile.Close()
+
+	if copyErr != nil {
 		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
+		if errors.As(copyErr, &maxErr) {
 			http.Error(w, fmt.Sprintf("File too large: max %d bytes", DiskLimit),
 				http.StatusRequestEntityTooLarge)
 			return
 		}
-		log.Printf("ERROR: read failed from %s: %v", ip, err)
+		log.Printf("ERROR: read failed from %s: %v", ip, copyErr)
 		http.Error(w, "Failed to read file", http.StatusBadRequest)
 		return
 	}
-	if int64(len(data)) != r.ContentLength {
+	if closeErr != nil {
+		log.Printf("ERROR: close temp upload failed from %s: %v", ip, closeErr)
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+	if written != r.ContentLength {
 		log.Printf("REJECTED: size mismatch (expected %d, got %d) from %s",
-			r.ContentLength, len(data), ip)
+			r.ContentLength, written, ip)
 		http.Error(w, "Size mismatch", http.StatusBadRequest)
 		return
 	}
 
-	fileHash := generateFileHash(data)
+	fileHash := hex.EncodeToString(hasher.Sum(nil))
 
-	if len(data) <= RAMLimit {
+	// L-6/H-4: the signature binds the method, path, timestamp, nonce and
+	// SHA256(body). Verify before publishing anything.
+	if err := s.auth.VerifyRequestWithBodyHash(r, fileHash, "/file-api"); err != nil {
+		writeAuthError(w, err)
+		return
+	}
+
+	if written <= RAMLimit {
+		data, err := os.ReadFile(tempPath)
+		if err != nil {
+			log.Printf("ERROR: read temp upload failed: %v", err)
+			http.Error(w, "Internal error", http.StatusInternalServerError)
+			return
+		}
 		if err := s.store.SaveToRAM(fileHash, data); err != nil {
 			log.Printf("ERROR: RAM save failed: %v", err)
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
 		}
 		log.Printf("UPLOADED: %d bytes to RAM (hash: %s) from %s",
-			len(data), shortHash(fileHash), ip)
+			written, shortHash(fileHash), ip)
 	} else {
-		if err := s.store.SaveToDisk(fileHash, data); err != nil {
+		if err := s.store.SaveTempToDisk(fileHash, tempPath, written); err != nil {
 			log.Printf("ERROR: Disk save failed: %v", err)
 			http.Error(w, "Internal error", http.StatusInternalServerError)
 			return
 		}
 		log.Printf("UPLOADED: %d bytes to DISK (hash: %s) from %s",
-			len(data), shortHash(fileHash), ip)
+			written, shortHash(fileHash), ip)
 	}
 
 	// The Rust client expects the bare hash as text/plain.
@@ -424,13 +587,19 @@ func (s *Server) DownloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !checkGuard(r) {
 		log.Printf("REJECTED: missing guard header from %s", getClientIP(r))
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		http.Error(w, StealthRejectedBody, http.StatusForbidden)
 		return
 	}
 
 	ip := getClientIP(r)
 	if !s.rateLimiter.Allow(ip) {
 		http.Error(w, "Too many requests", http.StatusTooManyRequests)
+		return
+	}
+
+	// Verify the canonical signature before consuming the one-time file.
+	if err := s.auth.VerifyRequest(r, nil, "/file-api"); err != nil {
+		writeAuthError(w, err)
 		return
 	}
 
@@ -484,7 +653,14 @@ func (s *Server) InfoHandler(w http.ResponseWriter, r *http.Request) {
 
 	if !checkGuard(r) {
 		log.Printf("REJECTED: missing guard header from %s", getClientIP(r))
-		http.Error(w, "Forbidden", http.StatusForbidden)
+		http.Error(w, StealthRejectedBody, http.StatusForbidden)
+		return
+	}
+
+	// /info is not used by the 1.0 client, but keep the existence oracle
+	// behind the same canonical signature as /upload and /download.
+	if err := s.auth.VerifyRequest(r, nil, "/file-api"); err != nil {
+		writeAuthError(w, err)
 		return
 	}
 
@@ -515,6 +691,29 @@ func (s *Server) PingHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("pong"))
 }
 
+// routes builds the HTTP routing table shared by main and tests. Caddy
+// forwards /file-api/* without stripping the prefix, but the client signs the
+// unprefixed /upload and /download paths; the verifier removes the prefix
+// before checking the canonical envelope.
+func (s *Server) routes() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("POST /file-api/upload", s.UploadHandler)
+	mux.HandleFunc("GET /file-api/download/", s.DownloadHandler)
+	mux.HandleFunc("HEAD /file-api/info/", s.InfoHandler)
+	mux.HandleFunc("GET /file-api/info/", s.InfoHandler)
+	mux.HandleFunc("GET /file-api/ping", s.PingHandler)
+
+	// Direct/internal aliases.
+	mux.HandleFunc("POST /upload", s.UploadHandler)
+	mux.HandleFunc("GET /download/", s.DownloadHandler)
+	mux.HandleFunc("HEAD /info/", s.InfoHandler)
+	mux.HandleFunc("GET /info/", s.InfoHandler)
+	mux.HandleFunc("GET /ping", s.PingHandler)
+
+	return mux
+}
+
 // startCleanupWorker — background cleanup of expired files.
 func (s *Server) startCleanupWorker(ctx context.Context) {
 	ticker := time.NewTicker(CleanupInterval)
@@ -528,6 +727,7 @@ func (s *Server) startCleanupWorker(ctx context.Context) {
 				log.Printf("CLEANUP: removed %d files", removed)
 			}
 			s.rateLimiter.Cleanup()
+			s.auth.PurgeExpired()
 		case <-ctx.Done():
 			return
 		}
@@ -541,6 +741,16 @@ func main() {
 
 	if effectiveHeaderName == "" || effectiveHeaderValue == "" {
 		log.Fatalf("CRITICAL: Stealth security headers (STEALTH_HEADER_NAME/VALUE) not set in environment")
+	}
+
+	nets, err := loadTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDR"))
+	if err != nil {
+		log.Fatalf("CRITICAL: Invalid TRUSTED_PROXY_CIDR: %v", err)
+	}
+	trustedProxyNets = nets
+	if nets == nil {
+		log.Printf("TRUSTED_PROXY_CIDR is not set: trusting every loopback/RFC1918/ULA peer as a proxy. " +
+			"Set it to Caddy's address or bridge subnet to narrow this.")
 	}
 
 	if err := os.MkdirAll(vaultPath, 0700); err != nil {
@@ -558,25 +768,9 @@ func main() {
 
 	server := NewServer()
 
-	mux := http.NewServeMux()
-
-	// Caddy forwards /file-api/* without stripping the prefix.
-	mux.HandleFunc("POST /file-api/upload", server.UploadHandler)
-	mux.HandleFunc("GET /file-api/download/", server.DownloadHandler)
-	mux.HandleFunc("HEAD /file-api/info/", server.InfoHandler)
-	mux.HandleFunc("GET /file-api/info/", server.InfoHandler)
-	mux.HandleFunc("GET /file-api/ping", server.PingHandler)
-
-	// Direct/internal aliases.
-	mux.HandleFunc("POST /upload", server.UploadHandler)
-	mux.HandleFunc("GET /download/", server.DownloadHandler)
-	mux.HandleFunc("HEAD /info/", server.InfoHandler)
-	mux.HandleFunc("GET /info/", server.InfoHandler)
-	mux.HandleFunc("GET /ping", server.PingHandler)
-
 	httpServer := &http.Server{
 		Addr:           ":8081", // Internal Docker-network port
-		Handler:        mux,
+		Handler:        server.routes(),
 		ReadTimeout:    60 * time.Second,
 		WriteTimeout:   120 * time.Second,
 		IdleTimeout:    180 * time.Second,

@@ -10,14 +10,26 @@ services:
       - sms-relay
       - file-relay
     environment:
-      DOMAIN: ${DOMAIN}
-      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME}
-      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE}
-      ACME_EMAIL: ${ACME_EMAIL}
+      # `:?` makes `docker compose up` fail with an actionable message instead
+      # of starting Caddy with empty variables, which is a Caddyfile parse
+      # error ("wrong argument count ... after 'email'").
+      DOMAIN: ${DOMAIN:?DOMAIN must be set in .env}
+      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME:?STEALTH_HEADER_NAME must be set in .env}
+      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE:?STEALTH_HEADER_VALUE must be set in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL must be set in .env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      # Enable this volume only together with the access-log block in the
+      # Caddyfile, so entrypoint-level rotation survives restarts.
+      # - caddy_logs:/var/log/caddy
+    logging:
+      # Bound on-disk container logs; no unbounded retention.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - internal
 
@@ -30,9 +42,17 @@ services:
         limits:
           memory: 256M
     environment:
-      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME}
-      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE}
+      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME:?STEALTH_HEADER_NAME must be set in .env}
+      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE:?STEALTH_HEADER_VALUE must be set in .env}
+      # Optional allow-list of proxies whose X-Real-IP is trusted. Unset keeps
+      # the legacy loopback/RFC1918/ULA behaviour; see env.example.
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
       ADMIN_JWT_SECRET: ${ADMIN_JWT_SECRET}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     expose:
       - "8080"
     networks:
@@ -47,10 +67,18 @@ services:
         limits:
           memory: 512M
     environment:
-      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME}
-      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE}
+      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME:?STEALTH_HEADER_NAME must be set in .env}
+      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE:?STEALTH_HEADER_VALUE must be set in .env}
+      # Optional allow-list of proxies whose X-Real-IP is trusted. Unset keeps
+      # the legacy loopback/RFC1918/ULA behaviour; see env.example.
+      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
     volumes:
       - ./data/vault:/var/lib/lastchance/vault
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     expose:
       - "8081"
     networks:
@@ -59,6 +87,7 @@ services:
 volumes:
   caddy_data:
   caddy_config:
+  # caddy_logs:
 
 networks:
   internal:

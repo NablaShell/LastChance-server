@@ -1,0 +1,57 @@
+{
+  "canonical": [
+    {
+      "name": "sorted_query",
+      "method": "get",
+      "path": "/pull/abc/",
+      "query": "b=2&a=1",
+      "timestamp": 1700000000,
+      "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYX",
+      "body": "",
+      "canonical": "GET\n/pull/abc\na=1&b=2\n1700000000\nAAECAwQFBgcICQoLDA0ODxAREhMUFRYX\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "percent_encoding",
+      "method": "GET",
+      "path": "/pull/x",
+      "query": "b=%2F&a=%20",
+      "timestamp": 1700000000,
+      "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYX",
+      "body": "",
+      "canonical": "GET\n/pull/x\na=%20&b=%2F\n1700000000\nAAECAwQFBgcICQoLDA0ODxAREhMUFRYX\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "empty_query",
+      "method": "GET",
+      "path": "/pull/x",
+      "query": "",
+      "timestamp": 1700000000,
+      "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYX",
+      "body": "",
+      "canonical": "GET\n/pull/x\n\n1700000000\nAAECAwQFBgcICQoLDA0ODxAREhMUFRYX\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "body_hash",
+      "method": "POST",
+      "path": "/upload",
+      "query": "",
+      "timestamp": 1700000000,
+      "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYX",
+      "body": "payload",
+      "canonical": "POST\n/upload\n\n1700000000\nAAECAwQFBgcICQoLDA0ODxAREhMUFRYX\n239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+    }
+  ],
+  "signature": {
+    "seed": "0101010101010101010101010101010101010101010101010101010101010101",
+    "public_key": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "identity": "34750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e",
+    "method": "POST",
+    "path": "/push/abc",
+    "query": "b=2&a=1",
+    "timestamp": 1700000000,
+    "nonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYX",
+    "body": "payload",
+    "canonical": "POST\n/push/abc\na=1&b=2\n1700000000\nAAECAwQFBgcICQoLDA0ODxAREhMUFRYX\n239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5",
+    "signature": "01laW31npIlIEnVpYUC6_YCKYpSlIz-VKlQAYDQZEa6wjfI2U3y0ORIO6hVcs4AfMqBN5bghOffi46IwHYv9CQ"
+  }
+}
