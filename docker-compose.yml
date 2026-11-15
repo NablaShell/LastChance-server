@@ -34,7 +34,7 @@ services:
       - internal
 
   sms-relay:
-    build: ./node
+    build: ./smg-relay
     container_name: sms-relay
     restart: unless-stopped
     deploy:

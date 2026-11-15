@@ -5,10 +5,10 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=1 GOOS=linux \
-    go build -ldflags="-w -s" -o /relay-node .
+    go build -ldflags="-w -s" -o /smg-relay .
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates
-COPY --from=builder /relay-node /relay-node
+COPY --from=builder /smg-relay /smg-relay
 EXPOSE 8080
-ENTRYPOINT ["/relay-node"]
+ENTRYPOINT ["/smg-relay"]

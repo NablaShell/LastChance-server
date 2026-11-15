@@ -5,9 +5,10 @@ A high-performance, privacy-focused dual-node relay system built with Go. Design
 ## Architecture Overview
 
 The system consists of two specialized nodes orchestrated by a Caddy reverse proxy:
-- **SMS Relay (Node):** Handles lightweight message queuing using an in-memory SQLite provider and Ed25519 cryptographic authorization.
-- **File Relay (File API):** Manages temporary file storage with a hybrid RAM/Disk approach and secure deletion (shredding).
-- **Caddy Proxy:** Acts as the "Stealth Layer," handling SSL (TLS 1.3), anti-scanning headers, and request filtering.
+- **SMS Relay (`smg-relay/`):** Handles lightweight message queuing using an in-memory SQLite provider and Ed25519 cryptographic authorization. Serves `/api-v1/*` on port `8080`.
+- **File Relay (`file_api/`):** Manages temporary file storage with a hybrid RAM/Disk approach and secure deletion (shredding). Serves `/file-api/*` on port `8081`.
+- **Caddy Proxy (`Caddyfile`):** Acts as the "Stealth Layer," handling SSL (TLS 1.3), anti-scanning headers, and request filtering. `docker-compose.yml` builds both relays and wires them to Caddy.
+- **Shared auth vectors (`testdata/`):** `auth_vectors.json` pins the canonical request envelope used by the Rust client and by both Go verifiers, so the services cannot drift apart silently.
 
 ## Security Features
 
@@ -35,6 +36,7 @@ Changing the client to sign the external prefixed path is a **breaking protocol 
 - `X-Auth-Nonce` is base64url without padding, decoding to 16..=32 bytes. It is checked only after the signature verifies, so invalid signatures cannot fill the replay cache. A nonce is accepted once per identity; the cache keeps entries for 150 seconds and fails closed with `503` when full.
 - `X-Auth-Signature` is base64url without padding over the canonical envelope.
 - `X-Auth-Identity` and the identity hash in `X-Identity-Key` are compared case-insensitively; the signature and nonce are byte-exact.
+- Every auth failure returns the same body, `unauthorized`: status `401`, or `503` when the nonce cache is exhausted. A missing or wrong stealth header returns `forbidden` with `403`. No response reveals which check failed.
 - `/ping` (and `/file-api/ping`) are unauthenticated health endpoints. `/file-api/info` is metadata, not a health check, and requires the same signature as `/upload` and `/download`.
 - Uploads are hashed while streaming to a temporary file; the request body is not buffered in memory. The temp file is removed on every rejection path.
 - The upload ceiling is **128 MiB** (`DiskLimit`), matching `FILE_MAX_ENVELOPE` in the Rust client. Caddy enforces the same cap with `request_body max_size 134217728`, so oversized bodies are rejected before the relay reads them. The text node caps request bodies at 1 MiB in Caddy; a text packet is at most 64 KiB.
@@ -80,6 +82,37 @@ The stealth header is **not a security boundary** against someone who knows it �
 
 The Rust client builds the encrypted envelope in memory and computes `SHA256(body)` over that same buffer; there is no separate hashing copy. A harness copy exists when the envelope is converted to the HTTP body, so peak client memory is roughly `2 × envelope`. The protocol ceiling is 128 MiB, which is acceptable on desktop but risky on low-memory mobile devices; a client-side cap of 64 MiB is a reasonable product choice if mobile is a target.
 
+## API Reference
+
+Caddy forwards `/api-v1/*` to `sms-relay:8080` and `/file-api/*` to `file-relay:8081` without stripping the prefix. Both relays also register the unprefixed paths for direct/internal calls. Every endpoint below requires the stealth header and — except `/ping` — the Ed25519 signature described above.
+
+| Service | Method | Path | Auth | Behaviour |
+| :--- | :--- | :--- | :--- | :--- |
+| SMS Relay | `POST` | `/api-v1/push/{target_hash}` | Signed, body hash | Accepts one packet per request. `Content-Length` must be one of the fixed size-grid values: 256 B, 1 KiB, 4 KiB or 64 KiB. Returns `200`; `429` when the bucket already holds 100 messages (`MaxMessagesPerHash`). |
+| SMS Relay | `GET` | `/api-v1/pull/{target_hash}` | Signed | Atomically takes and deletes every queued packet for the bucket and returns them as `multipart/form-data`. `X-Auth-Identity` must equal `{target_hash}`. Returns `204` when the bucket is empty. Supports long-polling (see below). |
+| SMS Relay | `GET` | `/api-v1/ping` | None | Liveness probe, returns `pong`. |
+| File Relay | `POST` | `/file-api/upload` | Signed, body hash | Requires an explicit `Content-Length`. Hashes while streaming to a temp file instead of buffering the body in memory, then returns the lowercase hex SHA-256 of the stored bytes as `text/plain`. |
+| File Relay | `GET` | `/file-api/download/{hash}` | Signed | One-time download: the entry is removed atomically before the response is written, so a concurrent or later request gets `404`. Streams `application/octet-stream`. |
+| File Relay | `HEAD`, `GET` | `/file-api/info/{hash}` | Signed | Metadata only: `Content-Length` plus `X-File-Storage: ram` or `disk`; `404` if the hash is absent. |
+| File Relay | `GET` | `/file-api/ping` | None | Liveness probe, returns `pong`. |
+
+### Long-polling pulls
+
+`GET /pull/{target_hash}` accepts an optional `?wait=<seconds>`:
+
+- no parameter, `0`, or a non-numeric value keeps the legacy behaviour: an empty bucket returns `204` immediately;
+- `1`..`30` holds the request until a packet arrives or the timer expires; larger values are clamped to `MaxLongPollWait` (30 s);
+- a successful `POST /push` signals the bucket's notification channel right after the package is committed, so a waiting pull answers without polling;
+- a timeout returns `204`; if the client disconnects, the request returns without writing a body.
+
+The waiter subscribes **before** the first bucket check, so a push that lands between the check and the wait is not lost. Notification channels are created lazily for hashes with at least one waiter and deleted when the last waiter leaves, so idle buckets do not leak memory. The HTTP `WriteTimeout` is 45 s, deliberately above the 30 s maximum wait so the server does not cut a hanging long-poll short.
+
+### Message and file retention
+
+- The text relay keeps its queue in an in-memory SQLite database (`:memory:`). Each bucket is capped at 100 messages, every message expires after 24 hours, and a cleanup worker runs every 10 minutes.
+- The file relay keeps files up to **1 MiB** in RAM for **30 minutes**; larger files (up to the 128 MiB ceiling) are written to the vault directory (`VAULT_PATH`, default `/tmp/lastchance_vault`) with mode `0600` for **1 hour**. A cleanup worker runs every 5 minutes.
+- Deleting a file overwrites it first: when the `shred` binary is available the relay runs `shred -u -n 3`, otherwise it falls back to a plain unlink. The vault is purged of leftover `*.bin` and `*.tmp` files at startup.
+
 ## Deployment
 
 1. **Configure Environment:**
@@ -108,9 +141,20 @@ caddy validate --config Caddyfile --adapter caddyfile --envfile .env
 caddy validate --config Caddyfile --adapter caddyfile --envfile env.example
 ```
 
-`go test` in `node/` runs the same check automatically when a `caddy` binary is on `PATH` (`TestCaddyfileValidates`) and skips it otherwise.
+`go test` in `smg-relay/` runs the same check automatically when a `caddy` binary is on `PATH` (`TestCaddyfileValidates`) and skips it otherwise.
 
 The one warning that remains — `server is listening only on the HTTP port` — is expected: the `http://` block exists only to answer plaintext requests with `403`.
+
+### Running the tests
+
+Both services are standalone Go modules and are tested from their own directory:
+
+```bash
+(cd smg-relay && go test ./...)   # text relay
+(cd file_api && go test ./...)    # file relay
+```
+
+The suites cover canonical signatures, nonce replay, prefix handling, proxy trust, rate-limiter bounds, long-polling, and the Caddyfile. `TestCaddyfileValidates` runs Caddy's real parser when a `caddy` binary is on `PATH` and skips it otherwise. Both relays also run `TestCanonicalVectorsMatchSharedFixture` against `testdata/auth_vectors.json`, so a verifier that stops matching the Rust client's envelope fails the build.
 
 ### Security Audit & Feedback
 

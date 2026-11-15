@@ -1,7 +1,7 @@
 // Authentication for the LastChance network API (H-4).
 //
 // This file mirrors src/network/auth.rs from the 1.0 client release and the
-// node/auth.go verifier. Keep the canonical envelope, header names and nonce
+// smg-relay/auth.go verifier. Keep the canonical envelope, header names and nonce
 // rules in sync with the Rust code and with the text relay.
 //
 //	METHOD \n PATH \n CANONICAL_QUERY \n TIMESTAMP \n NONCE \n SHA256(body)
