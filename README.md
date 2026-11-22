@@ -148,7 +148,9 @@ non-root uid/gid 10001, `EXPOSE 8080 8081`, and
 ## Deployment
 
 1. Copy `env.example` to `.env` and set `DOMAIN`, `ACME_EMAIL`,
-   `STEALTH_HEADER_NAME` and `STEALTH_HEADER_VALUE`.
+   `STEALTH_HEADER_NAME` and `STEALTH_HEADER_VALUE`. `./start.sh up` seeds
+   `.env` from `env.example` when it creates the config template, but the
+   required values still have to be edited.
 2. Install the container config once:
 
    ```bash
@@ -196,6 +198,7 @@ root, and expects `.env` to contain the values from the deployment steps above.
 ```bash
 ./start.sh up        # default: config -> data -> compose up -> wait for healthy
 ./start.sh config    # create the template if missing, then open it in $EDITOR
+./start.sh env       # seed .env from env.example, then open it in $EDITOR
 ./start.sh restart   # restart lc-server and wait for healthy
 ./start.sh logs      # docker compose logs -f
 ./start.sh health    # healthcheck status plus compose ps
@@ -207,12 +210,18 @@ root, and expects `.env` to contain the values from the deployment steps above.
 `0600` only when absent, creates `./data` and chowns it to `10001:10001`
 (stopping with a `sudo chown` hint if that fails), runs
 `docker compose up -d --remove-orphans`, then waits up to 90 s for the
-container health check and prints `docker compose ps`. `config` falls back to
-`nano`, `vim` or `vi` when `$EDITOR` is unset and reminds you to restart
-afterwards; `restart` waits 60 s for health. The built-in template binds
-`0.0.0.0:8080` / `0.0.0.0:8081` and stores data under `/var/lib/lc-server`,
-so it is intended for the container rather than a local non-Docker run; review
-it against [Configuration](#configuration) before the first start.
+container health check and prints `docker compose ps`. When it writes the
+config template it also seeds `.env` from `env.example`. `config` and `env`
+open `~/.config/lc-server/config.toml` and `.env` respectively, falling back to
+an installed editor (`nano`, `vim` or `vi`; `env` also tries `micro`) when
+`$EDITOR` is unset. After saving they chown `~/.config/lc-server` to
+`10001:10001` via `sudo`, reset `config.toml` to mode `0600` and run
+`docker compose restart lc-server`; `restart` waits 60 s for health. The
+built-in template binds
+`0.0.0.0:8080` / `0.0.0.0:8081` and points `db_path` and the files directory
+at `/var/lib/lc-server`, so it is intended for the container rather than a
+local non-Docker run; review it against [Configuration](#configuration) before
+the first start.
 
 ### Caddy variants
 

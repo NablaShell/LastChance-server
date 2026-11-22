@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${HOME}/.config/lc-server"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
+ENV_FILE=".env"
 DATA_DIR="${SCRIPT_DIR}/data"
 LC_UID_GID="10001:10001"
 COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
@@ -53,6 +54,8 @@ message_ttl_hours = 72
 file_ttl_hours = 168
 EOF
   chmod 600 "$CONFIG_FILE"
+
+  cp env.example .env
 }
 
 ensure_config() {
@@ -64,6 +67,14 @@ ensure_config() {
   write_default_config
   ok "created $CONFIG_FILE (mode 600)"
   warn "don't forget to change guard_header_value: ./start.sh config"
+  if [[ -f "$ENV_FILE" ]]; then
+    ok "config exists: $ENV_FILE"
+    return 0
+  fi
+  info "config not found — creating template at $ENV_FILE"
+  write_default_config
+  ok "created $ENV_FILE (mode 600)"
+  warn "don't forget to change guard_header_value: ./start.sh env"
 }
 
 # ---------- data ----------
@@ -123,6 +134,27 @@ cmd_config() {
   if docker inspect lc-server >/dev/null 2>&1; then
     warn "changes will take effect after: ./start.sh restart"
   fi
+  sudo chown -R 10001:10001 ~/.config/lc-server
+  sudo chmod 600 ~/.config/lc-server/config.toml
+  docker compose restart lc-server
+}
+
+cmd_env() {
+  ensure_config
+  local editor="${EDITOR:-}"
+  if [[ -z "$editor" ]]; then
+    for e in micro nano vim vi; do command -v "$e" >/dev/null 2>&1 && { editor="$e"; break; }; done
+  fi
+  [[ -n "$editor" ]] || die "no editor found (nano/vim/vi) — set \$EDITOR"
+  info "opening $ENV_FILE in $editor"
+  "$editor" "$ENV_FILE"
+  ok "config saved"
+  if docker inspect lc-server >/dev/null 2>&1; then
+    warn "changes will take effect after: ./start.sh restart"
+  fi
+  sudo chown -R 10001:10001 ~/.config/lc-server
+  sudo chmod 600 ~/.config/lc-server/config.toml
+  docker compose restart lc-server
 }
 
 cmd_restart() {
@@ -147,6 +179,7 @@ usage: $0 <command>
 
   up        idempotent start: config (if missing) → data → compose up → wait healthy
   config    create template (if missing) and open it in \$EDITOR
+  env       edit .env for docker compose 
   restart   restart lc-server and wait for healthy
   logs      docker compose logs -f
   health    healthcheck status + compose ps
@@ -158,6 +191,7 @@ EOF
 case "${1:-up}" in
   up)      cmd_up ;;
   config)  cmd_config ;;
+  env)  cmd_env ;;
   restart) cmd_restart ;;
   logs)    shift; cmd_logs "$@" ;;
   health)  cmd_health ;;
