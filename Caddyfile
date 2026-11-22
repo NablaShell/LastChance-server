@@ -1,12 +1,14 @@
-# Every {$VAR} below must be set. Caddy expands a missing variable to an empty
-# string, and an empty argument makes this file fail to parse (for example
-# `email` with no address). Validate with the same environment you deploy with:
+# LastChance edge proxy.
+#
+# Caddy terminates TLS 1.3 and forwards:
+#   /push*, /pull*                 -> lc-server:8080 (relay)
+#   /upload*, /download*           -> lc-server:8081 (files)
+#
+# The lc-server container publishes no host ports; only Caddy is reachable.
+# All {$VAR} values must be set (see env.example). Validate with:
 #
 #     caddy validate --config Caddyfile --adapter caddyfile --envfile .env
-#
-# or, without a .env, use the template:
-#
-#     caddy validate --config Caddyfile --adapter caddyfile --envfile env.example
+
 {
 	email {$ACME_EMAIL}
 	admin off
@@ -18,74 +20,93 @@
 		protocols tls1.3
 	}
 
-	# Anti-Scanning Stealth Layer
+	# Anti-scanning stealth layer. lc-server re-checks the same header.
 	@stealth {
 		header {$STEALTH_HEADER_NAME} {$STEALTH_HEADER_VALUE}
 	}
 
 	handle @stealth {
-		# Core Message Relay API
-		handle /api-v1/* {
+		# --- Text relay (relay listener) ---
+		handle /push* {
 			request_body {
-				# A text packet is at most 64 KiB; 1 MiB leaves room for the
-				# auth headers and rejects oversized bodies before the
-				# backend reads them.
-				max_size 1048576
+				max_size {$LC_MAX_BODY_BYTES:1048576}
 			}
-			reverse_proxy sms-relay:8080 {
-				# K3: overwrite, never append. Caddy does not set X-Real-IP by
-				# default, and it passes unknown headers through unchanged, so
-				# a client-supplied X-Real-IP would reach the relay and let a
-				# single header evade the per-IP rate limit. {remote_host} is
-				# the TCP peer, i.e. the real client.
+			reverse_proxy lc-server:8080 {
+				# Overwrite, never append: a client-supplied X-Real-IP must not
+				# reach the relay.
 				header_up X-Real-IP {remote_host}
-				# Same policy for X-Forwarded-For: set it explicitly instead
-				# of relying on Caddy's default (which depends on version and
-				# trusted_proxies). The result is a single hop, not a chain.
-				# See "Rate limiting and client identity" in README.md
-				# before placing another proxy in front of Caddy.
 				header_up X-Forwarded-For {remote_host}
 			}
 		}
 
-		# File Transfer API
-		handle /file-api/* {
+		handle /pull* {
 			request_body {
-				# Must match DiskLimit (128 MiB) in file_api/main.go, which in
-				# turn matches crypto::FILE_MAX_ENVELOPE in the Rust client.
-				# 134217728 bytes exactly; Caddy rejects larger bodies before
-				# they reach the relay.
-				max_size 134217728
+				max_size {$LC_MAX_BODY_BYTES:1048576}
 			}
-			reverse_proxy file-relay:8081 {
-				# K3: same as above.
+			reverse_proxy lc-server:8080 {
 				header_up X-Real-IP {remote_host}
 				header_up X-Forwarded-For {remote_host}
-				# Stream downloads without buffering them in the proxy.
+			}
+		}
+
+		# --- File relay (files listener) ---
+		handle /upload* {
+			request_body {
+				max_size {$LC_MAX_FILE_BYTES:134217728}
+			}
+			reverse_proxy lc-server:8081 {
+				header_up X-Real-IP {remote_host}
+				header_up X-Forwarded-For {remote_host}
+			}
+		}
+
+		handle /download* {
+			reverse_proxy lc-server:8081 {
+				header_up X-Real-IP {remote_host}
+				header_up X-Forwarded-For {remote_host}
+				# Stream downloads without buffering.
 				flush_interval -1
 			}
 		}
 
-		# TODO: Admin Dashboard Section
-		# handle /admin/* {
-		#     reverse_proxy admin-panel:8082
-		# }
+		# --- Legacy prefixes (optional, backward compatibility) ---
+		# handle_path strips /api-v1 and /file-api before proxying. The client
+		# signs the unprefixed path (/push/..., /upload, /download/...), so the
+		# signature contract is unchanged.
+		handle_path /api-v1/* {
+			request_body {
+				max_size {$LC_MAX_BODY_BYTES:1048576}
+			}
+			reverse_proxy lc-server:8080 {
+				header_up X-Real-IP {remote_host}
+				header_up X-Forwarded-For {remote_host}
+			}
+		}
 
-		# Default fallback for authorized requests
+		handle_path /file-api/* {
+			request_body {
+				max_size {$LC_MAX_FILE_BYTES:134217728}
+			}
+			reverse_proxy lc-server:8081 {
+				header_up X-Real-IP {remote_host}
+				header_up X-Forwarded-For {remote_host}
+				flush_interval -1
+			}
+		}
+
 		handle {
 			respond "" 404
 		}
 	}
 
-	# Unauthorized requests - Silent Drop
+	# Requests without the stealth header are dropped.
 	handle {
 		respond "" 403
 	}
 
 	# Access logging is intentionally disabled: a privacy relay must not
-	# persist client IPs and URIs by default. Caddy still logs runtime errors
-	# to stderr (docker logs). To opt in, mount a volume for /var/log/caddy
-	# and enable a size- and age-bounded log:
+	# persist client IPs and URIs by default. To opt in, mount a volume for
+	# /var/log/caddy and enable a bounded log:
 	#
 	# log {
 	#     output file /var/log/caddy/access.log {
@@ -97,7 +118,53 @@
 	# }
 }
 
-# Block direct IP access and insecure HTTP
+# -----------------------------------------------------------------------------
+# Variant B: separate subdomain for file traffic.
+#
+# Uncomment this block and remove the /upload* and /download* handles above.
+# Add FILES_DOMAIN to .env and point its DNS record at this host. The relay
+# remains on DOMAIN; files are isolated on their own hostname.
+#
+# {$FILES_DOMAIN} {
+# 	tls {
+# 		protocols tls1.3
+# 	}
+#
+# 	@stealth {
+# 		header {$STEALTH_HEADER_NAME} {$STEALTH_HEADER_VALUE}
+# 	}
+#
+# 	handle @stealth {
+# 		handle /upload* {
+# 			request_body {
+# 				max_size {$LC_MAX_FILE_BYTES:134217728}
+# 			}
+# 			reverse_proxy lc-server:8081 {
+# 				header_up X-Real-IP {remote_host}
+# 				header_up X-Forwarded-For {remote_host}
+# 			}
+# 		}
+#
+# 		handle /download* {
+# 			reverse_proxy lc-server:8081 {
+# 				header_up X-Real-IP {remote_host}
+# 				header_up X-Forwarded-For {remote_host}
+# 				flush_interval -1
+# 			}
+# 		}
+#
+# 		handle {
+# 			respond "" 404
+# 		}
+# 	}
+#
+# 	handle {
+# 		respond "" 403
+# 	}
+# }
+# -----------------------------------------------------------------------------
+
+# Block direct IP access and insecure HTTP.
 http:// {
 	respond "" 403
 }

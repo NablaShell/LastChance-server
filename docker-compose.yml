@@ -1,86 +1,74 @@
 services:
-  caddy:
-    image: caddy:alpine
-    container_name: revers-proxy
+  lc-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lc-server
     restart: unless-stopped
-    ports:
-      - "443:443"
-      - "80:80"
-    depends_on:
-      - sms-relay
-      - file-relay
     environment:
-      # `:?` makes `docker compose up` fail with an actionable message instead
-      # of starting Caddy with empty variables, which is a Caddyfile parse
-      # error ("wrong argument count ... after 'email'").
-      DOMAIN: ${DOMAIN:?DOMAIN must be set in .env}
+      # The container reads its TOML from the read-only mount below. That file
+      # must bind the listeners to 0.0.0.0:8080 and 0.0.0.0:8081.
+      LC_SERVER_CONFIG: /config/config.toml
       STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME:?STEALTH_HEADER_NAME must be set in .env}
       STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE:?STEALTH_HEADER_VALUE must be set in .env}
-      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL must be set in .env}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-      # Enable this volume only together with the access-log block in the
-      # Caddyfile, so entrypoint-level rotation survives restarts.
-      # - caddy_logs:/var/log/caddy
-    logging:
-      # Bound on-disk container logs; no unbounded retention.
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    networks:
-      - internal
-
-  sms-relay:
-    build: ./smg-relay
-    container_name: sms-relay
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-    environment:
-      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME:?STEALTH_HEADER_NAME must be set in .env}
-      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE:?STEALTH_HEADER_VALUE must be set in .env}
-      # Optional allow-list of proxies whose X-Real-IP is trusted. Unset keeps
-      # the legacy loopback/RFC1918/ULA behaviour; see env.example.
       TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
-      ADMIN_JWT_SECRET: ${ADMIN_JWT_SECRET}
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+    volumes:
+      # XDG config path on the host (equivalent to ~/.config/lc-server).
+      - ${HOME}/.config/lc-server:/config:ro
+      # bbolt database and file bodies. The process runs as uid 10001, so this
+      # bind mount must be writable by that uid (deploy.sh handles it).
+      - ./data:/var/lib/lc-server
     expose:
       - "8080"
-    networks:
-      - internal
-
-  file-relay:
-    build: ./file_api
-    container_name: file-relay
-    restart: unless-stopped
+      - "8081"
+    # Never publish relay/files ports on the host. Only Caddy is reachable.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "3", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     deploy:
       resources:
         limits:
           memory: 512M
-    environment:
-      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME:?STEALTH_HEADER_NAME must be set in .env}
-      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE:?STEALTH_HEADER_VALUE must be set in .env}
-      # Optional allow-list of proxies whose X-Real-IP is trusted. Unset keeps
-      # the legacy loopback/RFC1918/ULA behaviour; see env.example.
-      TRUSTED_PROXY_CIDR: ${TRUSTED_PROXY_CIDR:-}
-    volumes:
-      - ./data/vault:/var/lib/lastchance/vault
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-    expose:
-      - "8081"
+    networks:
+      - internal
+
+  caddy:
+    image: caddy:alpine
+    container_name: revers-proxy
+    restart: unless-stopped
+    depends_on:
+      lc-server:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN must be set in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL must be set in .env}
+      STEALTH_HEADER_NAME: ${STEALTH_HEADER_NAME:?STEALTH_HEADER_NAME must be set in .env}
+      STEALTH_HEADER_VALUE: ${STEALTH_HEADER_VALUE:?STEALTH_HEADER_VALUE must be set in .env}
+      # Keep the edge limits aligned with the lc-server config.
+      LC_MAX_BODY_BYTES: ${LC_MAX_BODY_BYTES:-1048576}
+      LC_MAX_FILE_BYTES: ${LC_MAX_FILE_BYTES:-134217728}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      # Enable together with the access-log block in Caddyfile.
+      # - caddy_logs:/var/log/caddy
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - internal
 

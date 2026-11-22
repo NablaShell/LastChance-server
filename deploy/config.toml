@@ -1,0 +1,24 @@
+# Container configuration. Mounted read-only at /config/config.toml.
+#
+# The host path used by docker-compose.yml is
+# ${HOME}/.config/lc-server/config.toml (XDG default). deploy.sh installs this
+# file only when it does not exist, so local edits are preserved.
+#
+# Bind to 0.0.0.0 inside the container: Caddy reaches lc-server over the
+# internal Docker bridge. No host port is published.
+[server]
+relay_addr = "0.0.0.0:8080"
+files_addr = "0.0.0.0:8081"
+max_body_bytes = 1048576
+max_file_bytes = 134217728
+pull_timeout_sec = 30
+relay_pull_max_concurrent = 64
+stealth_header_name = "X-DNS-Connect"
+stealth_header_value = ""
+trusted_proxy_cidr = ""
+
+[storage]
+db_path = "/var/lib/lc-server/lc.db"
+file_dir = "/var/lib/lc-server/files"
+file_ttl_hours = 1
+message_ttl_hours = 24

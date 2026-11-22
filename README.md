@@ -1,206 +1,376 @@
-# Last Chance Server 
+# Last Chance Server
 
-A high-performance, privacy-focused dual-node relay system built with Go. Designed for secure, asynchronous data exchange with a zero-footprint architecture.
+A privacy-focused relay for the Last Chance client. A single `lc-server`
+binary opens two listeners and shares one bbolt database:
 
-## Architecture Overview
+- **relay** (`127.0.0.1:8080` by default) — `POST /push/{recipient}`,
+  `GET /pull/{recipient}`, `GET /healthz`;
+- **files** (`127.0.0.1:8081` by default) — `POST /upload`,
+  `GET /download/{id}`, `GET /healthz`.
 
-The system consists of two specialized nodes orchestrated by a Caddy reverse proxy:
-- **SMS Relay (`smg-relay/`):** Handles lightweight message queuing using an in-memory SQLite provider and Ed25519 cryptographic authorization. Serves `/api-v1/*` on port `8080`.
-- **File Relay (`file_api/`):** Manages temporary file storage with a hybrid RAM/Disk approach and secure deletion (shredding). Serves `/file-api/*` on port `8081`.
-- **Caddy Proxy (`Caddyfile`):** Acts as the "Stealth Layer," handling SSL (TLS 1.3), anti-scanning headers, and request filtering. `docker-compose.yml` builds both relays and wires them to Caddy.
-- **Shared auth vectors (`testdata/`):** `auth_vectors.json` pins the canonical request envelope used by the Rust client and by both Go verifiers, so the services cannot drift apart silently.
+Caddy terminates TLS 1.3 and is the only container reachable from the host.
+The server ports are never published.
 
-## Security Features
+The documented build is static and CGO-free. The previous `smg-relay/` and
+`file_api/` modules, their in-memory SQLite queue and the separate file vault
+are replaced by one process and one persistent bbolt database.
 
-- **Asynchronous Stealth:** Uses custom header validation at the proxy level to drop unauthorized requests silently (403/404). The text and file relays re-check the same header, so reaching a backend container directly does not bypass the edge.
-- **Crypto-Auth:** `/push`, `/pull`, `/upload`, `/download` and `/info` require an Ed25519 signature over the canonical request envelope `METHOD \n PATH \n QUERY \n TIMESTAMP \n NONCE \n SHA256(body)`. The headers are `X-Auth-Identity`, `X-Identity-Key`, `X-Auth-Timestamp`, `X-Auth-Nonce` and `X-Auth-Signature` (base64url, no padding).
-- **Replay Protection:** Every nonce is accepted once per identity. Expired nonces are purged from the in-memory cache after `60 + 30 + 60` seconds, and a full cache fails closed with `503`.
-- **Canonical Binding:** The signature covers the method, path, sorted query, timestamp and body hash, so an endpoint, query value or upload body cannot be swapped in transit.
-- **Real client IP:** Rate limits are keyed by the peer address. `X-Real-IP` is honoured only when the peer is a trusted proxy (`TRUSTED_PROXY_CIDR` when set, otherwise loopback/RFC1918/ULA), and Caddy overwrites both `X-Real-IP` and `X-Forwarded-For` with `{remote_host}`; client-supplied forwarding headers are ignored.
-- **Auto-Purge:** Files and messages have strict TTL (Time-To-Live). One-time download policy: data is shredded immediately after delivery.
-- **Anti-Forensics:** Integrated `shred` utility support for overwriting disk sectors before file unlinking.
-- **No content logging:** Signatures, nonces and bodies are never logged. Operational logs contain only the client IP, method, path, short identity and a rejection reason. See [Privacy and logging](#privacy-and-logging).
+## Architecture
 
-The server removes the Caddy prefix (`/api-v1` for the text node, `/file-api` for the file node) before verifying the canonical path, because the client signs the unprefixed API path (`/push/<hash>`, `/pull/<hash>`, `/upload`, `/download/<hash>`). The prefix is **transport routing, not part of the signature**:
+```text
+client ──TLS──> Caddy ──/push, /pull──────────> lc-server:8080 ─┐
+                       └─/upload, /download──> lc-server:8081 ─┴─ bbolt + files
+```
 
-- `/api-v1/push/...` + a signature over `/push/...` → accepted;
-- `/push/...` + a signature over `/push/...` → accepted (also works if Caddy is switched to `handle_path`);
-- `/api-v1/push/...` + a signature over `/api-v1/push/...` → `401`.
+- `cmd/lc-server` starts two `http.Server` instances, handles `SIGINT` /
+  `SIGTERM`, and shuts them down with separate deadlines (relay 10 s, files
+  30 s). It also owns the background storage GC worker.
+- Listener timeouts are asymmetric: relay uses a 5 s read-header timeout, 10 s
+  read timeout, `pull_timeout_sec + 15 s` write timeout and 60 s idle timeout;
+  files uses 10 s read-header, 2-minute read/write and 3-minute idle timeouts.
+  Both cap request headers at 8 KiB.
+- `internal/config` loads TOML from the XDG config path with `LC_*` overrides
+  and creates a `0600` template on first run.
+- `internal/auth` verifies the Ed25519 request envelope and keeps replay state
+  in the nonce store.
+- `internal/store` defines `QueueStore`, `NonceStore` and `FileStore`; the
+  bbolt implementation provides atomic pull/take and TTL garbage collection.
+  Both listeners share the same `*store.Store` instance.
+- `internal/api` builds the two muxes, the long-poll notifier and the per-port
+  `MaxBytesReader` limits; `internal/middleware` provides the constant-time
+  stealth guard, request id, structured logging, client IP resolution and
+  per-listener rate limiting.
+- `internal/testutil` generates Ed25519 identities and signed headers for the
+  unit and end-to-end tests.
 
-Changing the client to sign the external prefixed path is a **breaking protocol change**. Moving the prefix rewrite into Caddy (`handle_path`) is not breaking, because the path seen by the relay is then already unprefixed and the stripping becomes a no-op.
+## Configuration
 
-### Authentication contract
+Default path: `$XDG_CONFIG_HOME/lc-server/config.toml`, usually
+`~/.config/lc-server/config.toml`. Precedence:
 
-- `X-Identity-Key` is `hex(ed25519_public_key)`. It is necessary because the relay has no contact registry and therefore cannot look a key up by identity. The server recomputes `identity = hex(SHA256(public_key))` and requires it to equal `X-Auth-Identity`; this proves possession of the private key and binds the request to that key. It is **self-authentication, not authorization**: any generated key can push to any bucket. `/pull` additionally requires `X-Auth-Identity` to equal the bucket hash in the URL, so only the key owner can read that bucket.
-- `X-Auth-Timestamp` is a decimal Unix timestamp in seconds (UTC, no leading zeros). The accepted window is `[now - 60, now + 30]`.
-- `X-Auth-Nonce` is base64url without padding, decoding to 16..=32 bytes. It is checked only after the signature verifies, so invalid signatures cannot fill the replay cache. A nonce is accepted once per identity; the cache keeps entries for 150 seconds and fails closed with `503` when full.
-- `X-Auth-Signature` is base64url without padding over the canonical envelope.
-- `X-Auth-Identity` and the identity hash in `X-Identity-Key` are compared case-insensitively; the signature and nonce are byte-exact.
-- Every auth failure returns the same body, `unauthorized`: status `401`, or `503` when the nonce cache is exhausted. A missing or wrong stealth header returns `forbidden` with `403`. No response reveals which check failed.
-- `/ping` (and `/file-api/ping`) are unauthenticated health endpoints. `/file-api/info` is metadata, not a health check, and requires the same signature as `/upload` and `/download`.
-- Uploads are hashed while streaming to a temporary file; the request body is not buffered in memory. The temp file is removed on every rejection path.
-- The upload ceiling is **128 MiB** (`DiskLimit`), matching `FILE_MAX_ENVELOPE` in the Rust client. Caddy enforces the same cap with `request_body max_size 134217728`, so oversized bodies are rejected before the relay reads them. The text node caps request bodies at 1 MiB in Caddy; a text packet is at most 72 KiB (a 64 KiB bucket plus up to 8 KiB of in-bucket padding).
+1. `--config /path/config.toml`
+2. `LC_SERVER_CONFIG=/path/config.toml`
+3. XDG default.
 
-### Rate limiting and client identity
+`LC_SERVER_CONFIG` selects the file path; it does not override a field. The
+binary has two flags: `--config /path/config.toml` and `--version` (print and
+exit).
 
-Both relays allow 5 requests/second with a burst of 10 per client IP. Buckets are dropped after 10 minutes of inactivity and the map is capped at 4096 entries, so the limiter can neither be bypassed by waiting for a periodic `Cleanup` nor grow without bound. The cap evicts the least-recently-seen bucket. That is acceptable **only** for a rate limiter: losing a bucket gives one IP one extra burst, it cannot enable a replay. Replay protection uses a separate nonce cache that fails closed with `503` and never evicts an unexpired nonce; the two structures are intentionally not shared.
+If the file is absent, `lc-server` creates it with mode `0600` (directory
+`0700`) from the embedded template. `db_path` and `file_dir` expand a leading
+`~`; other paths are used as given. The file uses two sections:
 
-The client IP is resolved as follows:
+```toml
+[server]
+relay_addr = "127.0.0.1:8080"
+files_addr = "127.0.0.1:8081"
+max_body_bytes = 1048576
+max_file_bytes = 134217728
+pull_timeout_sec = 30
+relay_pull_max_concurrent = 64
+stealth_header_name = "X-DNS-Connect"
+stealth_header_value = ""
+trusted_proxy_cidr = ""
 
-1. take the TCP peer address (`RemoteAddr`) and strip the port;
-2. if that peer is a trusted proxy, accept a syntactically valid `X-Real-IP`;
-3. otherwise ignore all forwarding headers and use the peer address.
+[storage]
+db_path = "~/.local/share/lc-server/lc.db"
+file_dir = "~/.local/share/lc-server/files"
+file_ttl_hours = 1
+message_ttl_hours = 24
+```
 
-A peer is trusted when it matches `TRUSTED_PROXY_CIDR` (comma-separated CIDRs or bare IPs, see `env.example`). **When that variable is unset, every loopback / RFC1918 / ULA peer is trusted**, which matches the shipped single-host Docker deployment where Caddy is the only peer. That default is broad: any other machine on the same private network or VLAN could spoof `X-Real-IP`. To narrow it, pin Caddy's address (for example `TRUSTED_PROXY_CIDR=172.18.0.2/32`) or the bridge subnet; an invalid value aborts startup instead of silently widening trust.
+Every value can be overridden with an environment variable:
 
-Caddy sets both `header_up X-Real-IP {remote_host}` and `header_up X-Forwarded-For {remote_host}` on both routes. `{remote_host}` is the TCP peer, i.e. the real client. Both headers are **overwritten, not appended**, so `X-Forwarded-For` contains exactly one address rather than a chain. The relays read only `X-Real-IP`; `X-Forwarded-For` is set for completeness and is never parsed. A forged `X-Real-IP` from a direct client therefore changes neither the rate-limit bucket nor the logged IP.
-
-> **Second proxy policy:** the single-hop XFF rewrite is correct only while Caddy is the first and only proxy. If another reverse proxy or CDN is placed in front of Caddy, the peer Caddy sees becomes that proxy, not the client. At that point this policy must change: enable Caddy's `trusted_proxies` for the front proxy, append to XFF instead of overwriting it, and decide which hop the relays should trust. Do not add a front proxy without revisiting `TRUSTED_PROXY_CIDR` and the Caddyfile together.
-
-Other containers on the same Docker network are inside the trust boundary. If a deployment shares that network with unrelated workloads, add network segmentation or a Caddy-to-backend shared secret; the stealth header alone is not sufficient there.
-
-### Trust boundary and TLS termination
-
-TLS terminates at Caddy. The shipped Caddyfile pins the listener to **TLS 1.3 only** (`tls { protocols tls1.3 }`), so the "TLS 1.3 + Ed25519 signature" boundary described above is enforced by configuration, not merely by wording. Caddy still obtains and renews certificates automatically via ACME.
-
-Caddy reaches both relays over **plain HTTP on the internal Docker bridge** (`sms-relay:8080`, `file-relay:8081`). This is acceptable only because the bridge is treated as trusted: neither relay publishes a host port (`expose`, not `ports`), and Caddy is the only legitimate peer. If Caddy is moved to another host, the bridge is no longer an isolation boundary — use a VPN/WireGuard tunnel or mTLS between Caddy and the relays, and never expose the relay ports publicly. The same applies if unrelated workloads share the network: segment it, or add a Caddy-to-backend shared secret.
-
-### Privacy and logging
-
-- Caddy access logging is **disabled by default**: a privacy relay should not persist every client IP and URI. Caddy runtime errors still go to stderr and are handled by the Docker logging driver. `Caddyfile` contains a commented, size- and age-bounded access-log block for operators who explicitly need one. Enabling it means storing every client IP, method, URI and status code for as long as the rotation keeps them — enable it only for a bounded debugging window.
-- Application logs contain the client IP, HTTP method, request path, a shortened identity hash and an auth rejection reason. They never contain the request body, the signature, or the nonce.
-- The Docker `json-file` driver's `max-size: 10m` / `max-file: 3` is **rotation, not "no logs"**: the services still write logs, and the files remain readable by anyone with Docker or root access. The bound is only on disk usage — roughly 30 MiB per container, with the oldest file deleted when a new one rotates in.
-- That retention is **size-based, not time-based**. `json-file` does not delete entries by age, so `max-file × max-size` is an upper bound on volume and nothing guarantees that logs disappear after N days. If a time bound is required, add `max-age` (Docker 25+) to the driver options alongside `max-size`/`max-file`, switch to the `local` driver, or ship logs to an external driver with its own retention. With access logging enabled, also mount a volume for `/var/log/caddy` so Caddy's file rotation survives container restarts.
-
-### Stealth header
-
-`STEALTH_HEADER_NAME` / `STEALTH_HEADER_VALUE` live in `.env` (see `env.example`), are injected into Caddy and both relays, and are never committed. Rotate them by editing `.env` and running `docker compose up -d`; no rebuild is needed. Unset values fail closed (every request is rejected).
-
-The stealth header is **not a security boundary** against someone who knows it — it only removes the relay from casual scanning. The real boundary is TLS 1.3 plus the Ed25519 request signature. If a deployment needs to restrict who may push, it needs a sender allowlist or recipient registration, which is not implemented here (see the identity model above).
-
-### Client-side upload memory
-
-The Rust client builds the encrypted envelope in memory and computes `SHA256(body)` over that same buffer; there is no separate hashing copy. A harness copy exists when the envelope is converted to the HTTP body, so peak client memory is roughly `2 × envelope`. The protocol ceiling is 128 MiB, which is acceptable on desktop but risky on low-memory mobile devices; a client-side cap of 64 MiB is a reasonable product choice if mobile is a target.
-
-## API Reference
-
-Caddy forwards `/api-v1/*` to `sms-relay:8080` and `/file-api/*` to `file-relay:8081` without stripping the prefix. Both relays also register the unprefixed paths for direct/internal calls. Every endpoint below requires the stealth header and — except `/ping` — the Ed25519 signature described above.
-
-| Service | Method | Path | Auth | Behaviour |
-| :--- | :--- | :--- | :--- | :--- |
-| SMS Relay | `POST` | `/api-v1/push/{target_hash}` | Signed, body hash | Accepts one packet per request. `Content-Length` must fall inside one of the client's padding buckets: 256–288 B, 1 KiB–1152 B, 4 KiB–4608 B or 64 KiB–72 KiB. Returns `200`; `429` when the bucket already holds 100 messages (`MaxMessagesPerHash`). |
-| SMS Relay | `GET` | `/api-v1/pull/{target_hash}` | Signed | Atomically takes and deletes every queued packet for the bucket and returns them as `multipart/form-data`. `X-Auth-Identity` must equal `{target_hash}`. Returns `204` when the bucket is empty. Supports long-polling (see below). |
-| SMS Relay | `GET` | `/api-v1/ping` | None | Liveness probe, returns `pong`. |
-| File Relay | `POST` | `/file-api/upload` | Signed, body hash | Requires an explicit `Content-Length`. Hashes while streaming to a temp file instead of buffering the body in memory, then returns the lowercase hex SHA-256 of the stored bytes as `text/plain`. |
-| File Relay | `GET` | `/file-api/download/{hash}` | Signed | One-time download: the entry is removed atomically before the response is written, so a concurrent or later request gets `404`. Streams `application/octet-stream`. |
-| File Relay | `HEAD`, `GET` | `/file-api/info/{hash}` | Signed | Metadata only: `Content-Length` plus `X-File-Storage: ram` or `disk`; `404` if the hash is absent. |
-| File Relay | `GET` | `/file-api/ping` | None | Liveness probe, returns `pong`. |
-
-### Long-polling pulls
-
-`GET /pull/{target_hash}` accepts an optional `?wait=<seconds>`:
-
-- no parameter, `0`, or a non-numeric value keeps the legacy behaviour: an empty bucket returns `204` immediately;
-- `1`..`30` holds the request until a packet arrives or the timer expires; larger values are clamped to `MaxLongPollWait` (30 s);
-- a successful `POST /push` signals the bucket's notification channel right after the package is committed, so a waiting pull answers without polling;
-- a timeout returns `204`; if the client disconnects, the request returns without writing a body.
-
-The waiter subscribes **before** the first bucket check, so a push that lands between the check and the wait is not lost. Notification channels are created lazily for hashes with at least one waiter and deleted when the last waiter leaves, so idle buckets do not leak memory. The HTTP `WriteTimeout` is 45 s, deliberately above the 30 s maximum wait so the server does not cut a hanging long-poll short.
-
-### Packet size padding
-
-The Rust client pads every text packet to `bucket + rand(0..=bucket/8)`, where the bucket is 256 B, 1 KiB, 4 KiB or 64 KiB. The relay validates the resulting `Content-Length` as a **range**, not as an exact bucket value:
-
-| Bucket | Accepted `Content-Length` |
+| Variable | Field |
 | :--- | :--- |
-| 256 B | 256–288 B |
-| 1 KiB | 1 KiB–1152 B |
-| 4 KiB | 4 KiB–4608 B |
-| 64 KiB | 64 KiB–72 KiB (`MaxPacketSize`) |
+| `LC_RELAY_ADDR` | `server.relay_addr` |
+| `LC_FILES_ADDR` | `server.files_addr` |
+| `LC_MAX_BODY_BYTES` | `server.max_body_bytes` |
+| `LC_MAX_FILE_BYTES` | `server.max_file_bytes` |
+| `LC_PULL_TIMEOUT_SEC` | `server.pull_timeout_sec` |
+| `LC_RELAY_PULL_MAX_CONCURRENT` | `server.relay_pull_max_concurrent` |
+| `LC_STEALTH_HEADER_NAME` / `LC_STEALTH_HEADER_VALUE` | stealth |
+| `LC_TRUSTED_PROXY_CIDR` | `server.trusted_proxy_cidr` |
+| `LC_DB_PATH`, `LC_FILE_DIR` | storage paths |
+| `LC_FILE_TTL_HOURS`, `LC_MESSAGE_TTL_HOURS` | retention |
 
-This mirrors `is_valid_packet_len()` in the client's `src/crypto/ratchet.rs`: a 283-byte packet (256 + 27 padding bytes) is valid, while one byte outside the grid on either side is rejected with `400`. Because the length is randomized inside the bucket, the exact `Content-Length` does not correlate with the plaintext size. `MaxPacketSize` is 73728 bytes (64 KiB + 8 KiB), and the body is read with a `MaxPacketSize + 1` limit so an oversized packet is rejected rather than silently truncated.
+Legacy aliases are accepted for `STEALTH_HEADER_NAME`,
+`STEALTH_HEADER_VALUE`, `TRUSTED_PROXY_CIDR` and `VAULT_PATH` (→
+`storage.file_dir`). `LC_*` wins over a legacy alias.
 
-### Message and file retention
+Validation rejects identical listener addresses, a shared port, malformed
+addresses, `max_file_bytes < max_body_bytes`, non-positive limits/TTLs and
+empty storage paths. An empty stealth header name or value is allowed by
+validation but fails closed: every guarded request gets `403`. An invalid
+`trusted_proxy_cidr` aborts startup instead of silently widening trust.
 
-- The text relay keeps its queue in an in-memory SQLite database (`:memory:`). Each bucket is capped at 100 messages, every message expires after 24 hours, and a cleanup worker runs every 10 minutes.
-- The file relay keeps files up to **1 MiB** in RAM for **30 minutes**; larger files (up to the 128 MiB ceiling) are written to the vault directory (`VAULT_PATH`, default `/tmp/lastchance_vault`) with mode `0600` for **1 hour**. A cleanup worker runs every 5 minutes.
-- Deleting a file overwrites it first: when the `shred` binary is available the relay runs `shred -u -n 3`, otherwise it falls back to a plain unlink. The vault is purged of leftover `*.bin` and `*.tmp` files at startup.
+Inside Docker the same file is mounted read-only at `/config/config.toml`;
+environment variables still take precedence over its values.
+
+Examples: `config.example.toml` (local, loopback) and `deploy/config.toml`
+(container, `0.0.0.0:8080` / `0.0.0.0:8081`, storage in `/var/lib/lc-server`).
+
+## Build
+
+Requires Go 1.26.2 or newer. The standard build produces a static, stripped
+binary:
+
+```bash
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/lc-server ./cmd/lc-server
+```
+
+On a weak VPS, build one package at a time:
+
+```bash
+CGO_ENABLED=0 GOMAXPROCS=1 go build -p 1 -trimpath -ldflags="-s -w" -o bin/lc-server ./cmd/lc-server
+```
+
+`bbolt`, the TOML parser and `golang.org/x/time` are pure Go, so
+`CGO_ENABLED=0` is fully supported; no SQLite or C toolchain is involved. Run
+locally with the default loopback listeners:
+
+```bash
+./bin/lc-server --config ./config.example.toml
+# or with the automatic XDG template:
+./bin/lc-server
+```
+
+`--version` prints the build version (`lc-server dev` for a build without
+`-ldflags "-X main.version=..."`).
+
+The Dockerfile is a hybrid builder. If `bin/lc-server` exists it is copied into
+the image (it must match the target architecture); otherwise the
+`golang:1.26-alpine` builder compiles it with the same `CGO_ENABLED=0` flags.
+The runtime stage is `alpine:latest` with `ca-certificates` and `tzdata`, a
+non-root uid/gid 10001, `EXPOSE 8080 8081`, and
+`LC_SERVER_CONFIG=/config/config.toml`.
 
 ## Deployment
 
-1. **Configure Environment:**
-   Copy `env.example` to `.env` and fill in your domain, stealth headers, and secrets. All four variables are required: `docker compose up` aborts with an explicit error if `DOMAIN`, `ACME_EMAIL`, `STEALTH_HEADER_NAME` or `STEALTH_HEADER_VALUE` is empty, instead of starting Caddy with a Caddyfile that cannot be parsed.
+1. Copy `env.example` to `.env` and set `DOMAIN`, `ACME_EMAIL`,
+   `STEALTH_HEADER_NAME` and `STEALTH_HEADER_VALUE`.
+2. Install the container config once:
 
-2. **Run Infrastructure:**
+   ```bash
+   mkdir -p ~/.config/lc-server
+   cp deploy/config.toml ~/.config/lc-server/config.toml
+   # edit stealth_header_value if you prefer TOML over the env variable
+   ```
+
+3. Start the stack:
+
    ```bash
    docker compose up -d --build
    ```
 
-### Validating the Caddyfile
+The compose file mounts `${HOME}/.config/lc-server:/config:ro` and
+`./data:/var/lib/lc-server`, publishes only Caddy's `80/443`, and health-checks
+`http://127.0.0.1:8080/healthz` inside the container. Caddy starts only after
+that check passes. lc-server is limited to 512 MiB, both containers use the
+`json-file` driver rotated at 10 MiB × 3, and the process runs as uid/gid
+10001, so `./data` must be writable by that uid.
 
-`Caddyfile` is fully env-driven (`{$DOMAIN}`, `{$ACME_EMAIL}`, `{$STEALTH_HEADER_NAME}`, `{$STEALTH_HEADER_VALUE}`). Caddy expands an unset variable to an **empty string**, so a bare `caddy validate` without those variables fails with a parse error, for example:
-
-```
-parsing caddyfile tokens for 'email': wrong argument count or unexpected line ending after 'email'
-```
-
-That message is about the missing `ACME_EMAIL`, not about the `email` directive itself. Always validate with an environment file:
+`deploy.sh` performs a cross-compile for `linux/$ARCH`, copies `bin/lc-server`,
+installs `deploy/config.toml` only when absent, and runs
+`docker compose up -d --build` on the remote host. The remote directory must
+already contain `docker-compose.yml`, `Caddyfile` and the rest of the deployment
+files; the script creates `bin/`, `data/` and `~/.config/lc-server`, and chowns
+`data/` to 10001 (warning if it lacks permission).
 
 ```bash
-# with your real deployment secrets
+HOST=relay.example.com REMOTE_DIR=/opt/lastchance-server ./deploy.sh
+# REMOTE_USER=deploy is optional (default: current local user)
+# ARM host: ARCH=arm64 ... ; weak VPS: WEAK_VPS=1 ...
+```
+
+`ARCH` defaults to `amd64` and must match the remote host; otherwise the
+container fails to exec the copied binary. Leave `bin/lc-server` absent from the
+build context to let the Docker builder compile inside the image instead.
+
+### Caddy variants
+
+`Caddyfile` ships with one public domain:
+
+- `/push*`, `/pull*` → `lc-server:8080`;
+- `/upload*`, `/download*` → `lc-server:8081`.
+
+Caddy applies `request_body max_size` from `LC_MAX_BODY_BYTES` /
+`LC_MAX_FILE_BYTES` to the push, pull and upload routes before proxying,
+overwrites `X-Real-IP` and `X-Forwarded-For` with `{remote_host}`, and streams
+downloads with `flush_interval -1`. The admin API is disabled, TLS is pinned to
+1.3, plain HTTP requests (including direct IP) get `403`, and requests without
+the stealth header are rejected with `403` at the edge.
+
+It also contains an active legacy mapping (`/api-v1/*`, `/file-api/*`) using
+`handle_path`, so clients that still send the old prefixes keep working: the
+prefix is stripped before proxying, and the signature is over the unprefixed
+path. The documented API surface stays `/push`, `/pull`, `/upload`,
+`/download` and `/healthz`; the old `/ping` and `/info` endpoints are not
+implemented (see [Migration](#migration-from-the-two-binary-layout)). A
+commented Variant B block routes files through a separate `FILES_DOMAIN`
+subdomain. Enable one variant at a time.
+
+Validate the Caddyfile with the same environment used for deployment:
+
+```bash
 caddy validate --config Caddyfile --adapter caddyfile --envfile .env
-
-# or, on a clean checkout, with the shipped template
-caddy validate --config Caddyfile --adapter caddyfile --envfile env.example
 ```
 
-`go test` in `smg-relay/` runs the same check automatically when a `caddy` binary is on `PATH` (`TestCaddyfileValidates`) and skips it otherwise.
+## API
 
-The one warning that remains — `server is listening only on the HTTP port` — is expected: the `http://` block exists only to answer plaintext requests with `403`.
+| Listener | Method | Path | Auth | Behaviour |
+| :--- | :--- | :--- | :--- | :--- |
+| relay | `POST` | `/push/{recipient}` | Signed, body hash | Accepts one text packet. `Content-Length` is required, must match the bytes read, and must fall inside a client padding bucket: 256–288 B, 1 KiB–1152 B, 4 KiB–4608 B or 64 KiB–72 KiB. Returns `200`; `400` for a missing/misaligned size, `413` above `max_body_bytes`, `429` when the recipient queue holds 100 messages. |
+| relay | `GET` | `/pull/{recipient}` | Signed | Atomically takes and deletes every queued packet and returns it as `multipart/form-data`. `X-Auth-Identity` must equal `{recipient}` (case-insensitive). Empty queue returns `204`; supports `?wait=N` long-polling. |
+| relay | `GET` | `/healthz` | None | `200` with `ok\n`, used by Docker. It is outside the guard and rate limiter. |
+| files | `POST` | `/upload` | Signed, body hash | Requires `Content-Length` (`411` otherwise) and a non-empty body. Hashes while streaming to a temp file, then returns the lowercase hex SHA-256 as `text/plain`; `413` above `max_file_bytes`. |
+| files | `GET` | `/download/{id}` | Signed | `{id}` must be a 64-character lowercase hex SHA-256 (`400` otherwise). One-time download: metadata is taken atomically, the body is streamed as `application/octet-stream`, then removed. A second or unknown request gets `404`. |
+| files | `GET` | `/healthz` | None | `200` with `ok\n`, used by Docker. It is outside the guard and rate limiter. |
 
-### Running the tests
+All API routes except `/healthz` require the stealth header and the Ed25519
+signature. Request-body limits are per listener: relay uses
+`max_body_bytes` (1 MiB default), files uses `max_file_bytes` (128 MiB
+default); Caddy enforces the matching `LC_MAX_*` caps at the edge, so keep them
+aligned with the TOML limits. Responses from the guarded API routes carry an
+`X-Request-ID` header: a sane inbound value (1–64 characters of
+`[A-Za-z0-9._-]`) is echoed, otherwise a 16-byte hex id is generated.
 
-Both services are standalone Go modules and are tested from their own directory:
+### Long-polling pulls
+
+`GET /pull/{recipient}?wait=N`:
+
+- no `wait`, `0` or an invalid value → immediate `204` on an empty queue;
+- `1..pull_timeout_sec` waits for a push, then returns it; larger values are
+  clamped;
+- only requests that find an empty queue and have `wait > 0` acquire a slot;
+  at most `relay_pull_max_concurrent` requests hold a long poll, and additional
+  waiters get `503` with `Retry-After: 1`;
+- the handler subscribes before checking the queue, so a push racing the check
+  is not lost;
+- client disconnect is observed through `r.Context()`, releases the semaphore
+  immediately and returns the non-standard `499` status.
+
+## Authentication
+
+Canonical envelope (must match the Rust client):
+
+```text
+METHOD \n PATH \n CANONICAL_QUERY \n TIMESTAMP \n NONCE \n SHA256(body)
+```
+
+`METHOD` is uppercased, `PATH` gets a leading `/` and loses trailing slashes,
+and `CANONICAL_QUERY` sorts pairs by key then value, joins them with `&` and
+preserves percent-encoding. The body hash is lowercase hex SHA-256.
+
+Headers:
+
+- `X-Identity-Key` — `hex(ed25519_public_key)`; the server recomputes
+  `hex(SHA256(public_key))` and requires it to match `X-Auth-Identity`;
+- `X-Auth-Identity` — `hex(SHA256(public_key))`;
+- `X-Auth-Timestamp` — decimal Unix seconds, accepted in
+  `[now - 60, now + 30]`;
+- `X-Auth-Nonce` — base64url without padding, 16..=32 decoded bytes;
+- `X-Auth-Signature` — base64url without padding over the envelope.
+
+This is self-authentication, not authorization: any generated key can push to
+any recipient. `/pull` additionally requires the identity to equal the
+recipient in the URL, so only the key owner can read that queue. Identity
+comparisons are ASCII case-insensitive; the nonce and signature are byte-exact.
+
+Every nonce is accepted once per identity and stored in bbolt for 150 seconds.
+A nonce is inserted only after the signature and timestamp checks pass, so junk
+requests cannot fill the store. The store is capped at 1024 live nonces per
+identity and fails closed with `503` rather than evicting a live nonce.
+Signature, body and nonce are never logged. All authentication failures return
+`unauthorized`; a missing or wrong stealth header returns `forbidden`.
+
+The shared `testdata/auth_vectors.json` pins the envelope and a real Ed25519
+signature, so a client or server drift fails the test suite.
+
+## Storage and retention
+
+- bbolt buckets: `queues` (recipient plus a big-endian sequence number),
+  `nonces` (identity plus nonce) and `files_meta` (`id`).
+- The database is opened with mode `0600` and a 2-second lock timeout; a second
+  process cannot open the same database concurrently.
+- `Pull` and `Take` are single bbolt write transactions. A concurrent second
+  download gets `404`.
+- Queue values store their creation time; queues are capped at 100 messages per
+  recipient and expire after `message_ttl_hours` (24 h default).
+- File bodies live in `file_dir` with mode `0600`; metadata and bodies expire
+  after `file_ttl_hours` (1 h default). Uploads stream through `.upload-*`
+  temp files. Files are removed after delivery, and temp/orphaned files are
+  cleaned at startup.
+- A background worker runs once at startup and every 5 minutes. It purges
+  expired messages, files and nonces, and drops idle rate-limiter buckets.
+
+## Security notes
+
+- **TLS 1.3 only** at Caddy. Backend traffic is plain HTTP on the internal
+  Docker bridge; the relay and files ports are not published.
+- **Stealth header** hides the service from casual scanning. It is not an
+  access-control boundary against someone who learns the value; the real
+  boundary is TLS plus the request signature.
+- **Client IP**: the TCP peer is used by default. `X-Real-IP` is honoured only
+  when the peer matches `TRUSTED_PROXY_CIDR`, or — when unset — is loopback /
+  RFC1918 / ULA. Caddy overwrites `X-Real-IP` and `X-Forwarded-For` with
+  `{remote_host}`. Invalid CIDR entries abort startup.
+- **Rate limiting**: each listener has its own limiter at 5 requests/second
+  with a burst of 10 per client IP, a bounded 4096-entry map, 10-minute idle
+  eviction and a sweep at most once per minute. Replay protection uses the
+  separate fail-closed nonce store.
+- **Logging**: structured `slog` JSON on stderr; method, path, status,
+  duration, peer address, request id and shortened identity only. Caddy access
+  logging is disabled by default. Docker's `json-file` logs rotate at 10 MiB
+  with three files retained.
+
+## Tests
 
 ```bash
-(cd smg-relay && go test ./...)   # text relay
-(cd file_api && go test ./...)    # file relay
+gofmt -l cmd internal e2e
+go vet ./...
+go test -count=1 ./...
+go test -race -count=1 ./...
 ```
 
-The suites cover canonical signatures, nonce replay, prefix handling, proxy trust, rate-limiter bounds, long-polling, and the Caddyfile. `TestCaddyfileValidates` runs Caddy's real parser when a `caddy` binary is on `PATH` and skips it otherwise. Both relays also run `TestCanonicalVectorsMatchSharedFixture` against `testdata/auth_vectors.json`, so a verifier that stops matching the Rust client's envelope fails the build.
+Coverage includes config template/env/legacy aliases/validation, tilde
+expansion and path precedence, bbolt push/pull/TTL/GC and concurrency, startup
+orphan/temp cleanup, canonical auth vectors, skew/replay/tampering, nonce-store
+capacity, per-port body limits, upload size/tampering checks, long-poll
+wake/timeout/cancel/semaphore, guard, request IDs, rate limiting, health checks
+and an end-to-end smoke test over both listeners. `TestCaddyfileValidates` runs
+Caddy's parser against `env.example` when `caddy` is on `PATH`.
 
-### Security Audit & Feedback
+## Migration from the two-binary layout
 
-This is an open-source project dedicated to secure communications. We highly encourage community audits. If you find vulnerabilities or have suggestions regarding:
+The old `smg-relay/` and `file_api/` modules were replaced by this single
+module and one persistent bbolt database. Old `/api-v1/*` and `/file-api/*`
+prefixes are accepted by Caddy's `handle_path` and stripped before proxying;
+clients must still sign the unprefixed path (`/push/...`, `/pull/...`,
+`/upload`, `/download/...`). The legacy mapping covers those four routes only:
+the old `/ping` and `/info` endpoints are not implemented, and `/healthz` is
+the unauthenticated liveness endpoint.
 
- - Ed25519 implementation logic.
- - Race conditions in the FileStore mutexes.
- - Proxy bypass techniques.
+The old SQLite queue used `:memory:` and had no persistent state to migrate.
+Existing file-vault data is not imported automatically; the new file store
+starts empty under `storage.file_dir`. Do not point `file_dir` at an old vault:
+startup cleanup deletes valid-looking file bodies that have no metadata in the
+new database.
 
-Please reach out via the secure channels below.
+## License
 
-### Support & Donation
+AGPL-3.0. See `LICENSE`.
 
-If this project helped you stay connected, consider supporting the maintenance:
+## Support & Donation
 
-    
 | Asset | Address |
 | :--- | :--- |
 | **BTC** | 8Arc4tRdGAKcWNMLCb7mj2fnYqWgQGhTTgR7FEGaZpL2Pw6MNSwqsGMUGpeQGURgQbDoyxU1ASKMP7dKBJq8yJgCSwCgPYe |
 | **XMR** | bc1qktffxm3579v6zs6mpms4yvwp6m067nkggd8ach |
 
-*All donations go towards relay nodes and security audits.*
+## Contact & Feedback
 
-### Contact & Feedback
-
-   Session ID: 05f08d7242fe9cd621e98ef902cd1a21a8bf10d0c7c946e8c8e469d2396657a637
-
-   ProtonMail: nabla.shell@proton.me
-
-   PGP Public Key: [here](https://github.com/NablaShell/LastChance/docs/public_key.asc) 
-   
-   *PGP Fingerprint: 885F 3675 1D87 3F99 55ED 0ABC D1F6 A559 1458 507D*
-
-
-##  License
-This project is licensed under the **AGPL-3.0 License** - see the LICENSE file for details.
+- Session ID: `05f08d7242fe9cd621e98ef902cd1a21a8bf10d0c7c946e8c8e469d2396657a637`
+- ProtonMail: `nabla.shell@proton.me`
+- PGP public key: <https://github.com/NablaShell/LastChance/docs/public_key.asc>
+- PGP fingerprint: `885F 3675 1D87 3F99 55ED 0ABC D1F6 A559 1458 507D`

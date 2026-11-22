@@ -1,0 +1,47 @@
+# LastChance server configuration.
+#
+# This file is created automatically with mode 0600 when it does not exist.
+# Values can be overridden with LC_* environment variables (see README.md).
+# Inside Docker the file is mounted read-only at /config/config.toml and the
+# container template binds the listeners to 0.0.0.0:8080 and 0.0.0.0:8081.
+
+[server]
+# Relay listener: POST /push/{recipient}, GET /pull/{recipient}, GET /healthz.
+relay_addr = "127.0.0.1:8080"
+
+# File listener: POST /upload, GET /download/{id}, GET /healthz.
+files_addr = "127.0.0.1:8081"
+
+# Hard cap for relay request bodies (text packets are at most 72 KiB).
+max_body_bytes = 1048576
+
+# Hard cap for uploads (must be >= max_body_bytes).
+max_file_bytes = 134217728
+
+# Upper bound for GET /pull/{recipient}?wait=N long-polling.
+pull_timeout_sec = 30
+
+# Maximum number of simultaneous long-polling pull requests.
+relay_pull_max_concurrent = 64
+
+# Anti-scanning header enforced by Caddy and re-checked by lc-server.
+# An empty value fails closed: every guarded request is rejected.
+stealth_header_name = "X-DNS-Connect"
+stealth_header_value = ""
+
+# Optional allow-list of proxies whose X-Real-IP is trusted. When empty,
+# loopback / RFC1918 / ULA peers are trusted (the shipped single-host setup).
+trusted_proxy_cidr = ""
+
+[storage]
+# bbolt database. Parent directories are created with mode 0700.
+db_path = "~/.local/share/lc-server/lc.db"
+
+# Uploaded file bodies. Files are stored with mode 0600.
+file_dir = "~/.local/share/lc-server/files"
+
+# Uploaded files expire after this many hours.
+file_ttl_hours = 1
+
+# Queued relay messages expire after this many hours.
+message_ttl_hours = 24

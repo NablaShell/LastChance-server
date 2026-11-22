@@ -1,0 +1,6 @@
+.git
+.codegraph
+data
+*.log
+README.md
+LICENSE

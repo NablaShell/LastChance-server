@@ -1,4 +1,5 @@
 # --- Binaries & Build Artifacts ---
+bin/
 build/bin/
 frontend/dist/
 *.exe
@@ -6,6 +7,11 @@ frontend/dist/
 *.dll
 *.so
 *.dylib
+
+# --- Runtime Data ---
+data/
+*.db
+*.db.lock
 
 # --- Wails Generated ---
 frontend/src/wailsjs/
@@ -31,9 +37,3 @@ node_modules/
 
 # --- Logs & Context ---
 *.log
-
-# --- Compiled relay binaries ---
-smg-relay/server-node
-smg-relay/smg-relay
-file_api/relay-file-node
-file_api/p2p_messenger_go_server_file

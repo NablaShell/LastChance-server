@@ -1,0 +1,23 @@
+# Local (non-container) configuration example.
+#
+# Copy to $XDG_CONFIG_HOME/lc-server/config.toml (usually
+# ~/.config/lc-server/config.toml), or pass another path with --config.
+# The server creates a 0600 template automatically when the file is absent.
+# Environment variables (LC_*) override every value.
+
+[server]
+relay_addr = "127.0.0.1:8080"
+files_addr = "127.0.0.1:8081"
+max_body_bytes = 1048576
+max_file_bytes = 134217728
+pull_timeout_sec = 30
+relay_pull_max_concurrent = 64
+stealth_header_name = "X-DNS-Connect"
+stealth_header_value = ""
+trusted_proxy_cidr = ""
+
+[storage]
+db_path = "~/.local/share/lc-server/lc.db"
+file_dir = "~/.local/share/lc-server/files"
+file_ttl_hours = 1
+message_ttl_hours = 24
