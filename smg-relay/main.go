@@ -26,11 +26,22 @@ import (
 // --- Protocol constants (must match the Rust client) ---
 
 const (
-	// The client accepts exactly this grid of message packet sizes.
+	// The client pads every packet to `bucket + rand(0..=bucket/8)`, where the
+	// bucket comes from this grid (see is_valid_packet_len() in the Rust
+	// client's src/crypto/ratchet.rs). The exact length is therefore
+	// randomized inside the bucket, so it must be validated as a range and
+	// never as an equality against the bucket size alone.
 	SizeVeryTiny = 256
 	SizeTiny     = 1024
 	SizeSmall    = 4096
 	SizeMax      = 65536
+
+	// SizePaddingDivisor is the client's maximum in-bucket padding: it adds
+	// up to bucket/8 random bytes on top of the bucket.
+	SizePaddingDivisor = 8
+
+	// MaxPacketSize is the largest packet the client can produce.
+	MaxPacketSize = SizeMax + SizeMax/SizePaddingDivisor
 
 	MaxMessagesPerHash = 100
 	MessageTTL         = 24 * time.Hour
@@ -57,12 +68,19 @@ const (
 	StealthRejectedBody = "forbidden"
 )
 
-// allowedSizes — O(1) lookup for the allowed packet-size grid.
-var allowedSizes = map[int64]bool{
-	SizeVeryTiny: true,
-	SizeTiny:     true,
-	SizeSmall:    true,
-	SizeMax:      true,
+// allowedSizes is the bucket grid the client pads messages to.
+var allowedSizes = [...]int64{SizeVeryTiny, SizeTiny, SizeSmall, SizeMax}
+
+// isValidPacketSize reports whether size is one of the padding buckets the
+// client can produce: a bucket plus its in-bucket random padding range
+// [bucket, bucket + bucket/8].
+func isValidPacketSize(size int64) bool {
+	for _, bucket := range allowedSizes {
+		if size >= bucket && size <= bucket+bucket/SizePaddingDivisor {
+			return true
+		}
+	}
+	return false
 }
 
 // Stealth header configured by the deployment. Caddy enforces the same pair
@@ -380,20 +398,20 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The Rust client always sends Content-Length and a packet from the
-	// fixed size grid.
+	// The Rust client always sends Content-Length and a v3 packet that is a
+	// bucket plus random in-bucket padding (bucket..bucket+bucket/8).
 	if r.ContentLength < 0 {
 		log.Printf("[PUSH] %s: unknown Content-Length", ip)
 		http.Error(w, "Invalid Payload Size", http.StatusBadRequest)
 		return
 	}
-	if !allowedSizes[r.ContentLength] {
+	if !isValidPacketSize(r.ContentLength) {
 		log.Printf("[PUSH] %s: invalid size %d", ip, r.ContentLength)
 		http.Error(w, "Invalid Payload Size", http.StatusBadRequest)
 		return
 	}
 
-	payload, err := io.ReadAll(io.LimitReader(r.Body, SizeMax+1))
+	payload, err := io.ReadAll(io.LimitReader(r.Body, MaxPacketSize+1))
 	if err != nil {
 		log.Printf("[PUSH] %s: read error: %v", ip, err)
 		http.Error(w, "Payload read error", http.StatusBadRequest)

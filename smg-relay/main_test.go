@@ -507,6 +507,44 @@ func TestPushRequiresCanonicalSignature(t *testing.T) {
 	}
 }
 
+func TestPushAcceptsInBucketPadding(t *testing.T) {
+	_, ts := newTestServer(t)
+	priv, _, targetHash := newIdentity(t)
+	pushURL := ts.URL + "/push/" + targetHash
+
+	push := func(size int) int {
+		payload := bytes.Repeat([]byte{0x5A}, size)
+		req, err := http.NewRequest(http.MethodPost, pushURL, bytes.NewReader(payload))
+		if err != nil {
+			t.Fatalf("new push (%d bytes): %v", size, err)
+		}
+		applyHeaders(req, signedHeaders(t, priv, http.MethodPost, "/push/"+targetHash, "", payload))
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("push (%d bytes): %v", size, err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// The client sends bucket + rand(0..=bucket/8); the production log showed
+	// "invalid size 283", which is a 256 bucket plus 27 padding bytes.
+	accepted := []int{SizeVeryTiny, SizeVeryTiny + SizeVeryTiny/8, SizeTiny + 37, MaxPacketSize}
+	for _, size := range accepted {
+		if status := push(size); status != http.StatusOK {
+			t.Fatalf("padded push of %d bytes status = %d, want 200", size, status)
+		}
+	}
+
+	// One byte outside the grid on either side must still be rejected.
+	rejected := []int{SizeVeryTiny - 1, SizeVeryTiny + SizeVeryTiny/8 + 1, SizeTiny - 1, MaxPacketSize + 1}
+	for _, size := range rejected {
+		if status := push(size); status != http.StatusBadRequest {
+			t.Fatalf("out-of-grid push of %d bytes status = %d, want 400", size, status)
+		}
+	}
+}
+
 func TestPushRejectsReplayedNonce(t *testing.T) {
 	_, ts := newTestServer(t)
 	priv, _, targetHash := newIdentity(t)

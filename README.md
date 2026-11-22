@@ -39,7 +39,7 @@ Changing the client to sign the external prefixed path is a **breaking protocol 
 - Every auth failure returns the same body, `unauthorized`: status `401`, or `503` when the nonce cache is exhausted. A missing or wrong stealth header returns `forbidden` with `403`. No response reveals which check failed.
 - `/ping` (and `/file-api/ping`) are unauthenticated health endpoints. `/file-api/info` is metadata, not a health check, and requires the same signature as `/upload` and `/download`.
 - Uploads are hashed while streaming to a temporary file; the request body is not buffered in memory. The temp file is removed on every rejection path.
-- The upload ceiling is **128 MiB** (`DiskLimit`), matching `FILE_MAX_ENVELOPE` in the Rust client. Caddy enforces the same cap with `request_body max_size 134217728`, so oversized bodies are rejected before the relay reads them. The text node caps request bodies at 1 MiB in Caddy; a text packet is at most 64 KiB.
+- The upload ceiling is **128 MiB** (`DiskLimit`), matching `FILE_MAX_ENVELOPE` in the Rust client. Caddy enforces the same cap with `request_body max_size 134217728`, so oversized bodies are rejected before the relay reads them. The text node caps request bodies at 1 MiB in Caddy; a text packet is at most 72 KiB (a 64 KiB bucket plus up to 8 KiB of in-bucket padding).
 
 ### Rate limiting and client identity
 
@@ -88,7 +88,7 @@ Caddy forwards `/api-v1/*` to `sms-relay:8080` and `/file-api/*` to `file-relay:
 
 | Service | Method | Path | Auth | Behaviour |
 | :--- | :--- | :--- | :--- | :--- |
-| SMS Relay | `POST` | `/api-v1/push/{target_hash}` | Signed, body hash | Accepts one packet per request. `Content-Length` must be one of the fixed size-grid values: 256 B, 1 KiB, 4 KiB or 64 KiB. Returns `200`; `429` when the bucket already holds 100 messages (`MaxMessagesPerHash`). |
+| SMS Relay | `POST` | `/api-v1/push/{target_hash}` | Signed, body hash | Accepts one packet per request. `Content-Length` must fall inside one of the client's padding buckets: 256–288 B, 1 KiB–1152 B, 4 KiB–4608 B or 64 KiB–72 KiB. Returns `200`; `429` when the bucket already holds 100 messages (`MaxMessagesPerHash`). |
 | SMS Relay | `GET` | `/api-v1/pull/{target_hash}` | Signed | Atomically takes and deletes every queued packet for the bucket and returns them as `multipart/form-data`. `X-Auth-Identity` must equal `{target_hash}`. Returns `204` when the bucket is empty. Supports long-polling (see below). |
 | SMS Relay | `GET` | `/api-v1/ping` | None | Liveness probe, returns `pong`. |
 | File Relay | `POST` | `/file-api/upload` | Signed, body hash | Requires an explicit `Content-Length`. Hashes while streaming to a temp file instead of buffering the body in memory, then returns the lowercase hex SHA-256 of the stored bytes as `text/plain`. |
@@ -106,6 +106,19 @@ Caddy forwards `/api-v1/*` to `sms-relay:8080` and `/file-api/*` to `file-relay:
 - a timeout returns `204`; if the client disconnects, the request returns without writing a body.
 
 The waiter subscribes **before** the first bucket check, so a push that lands between the check and the wait is not lost. Notification channels are created lazily for hashes with at least one waiter and deleted when the last waiter leaves, so idle buckets do not leak memory. The HTTP `WriteTimeout` is 45 s, deliberately above the 30 s maximum wait so the server does not cut a hanging long-poll short.
+
+### Packet size padding
+
+The Rust client pads every text packet to `bucket + rand(0..=bucket/8)`, where the bucket is 256 B, 1 KiB, 4 KiB or 64 KiB. The relay validates the resulting `Content-Length` as a **range**, not as an exact bucket value:
+
+| Bucket | Accepted `Content-Length` |
+| :--- | :--- |
+| 256 B | 256–288 B |
+| 1 KiB | 1 KiB–1152 B |
+| 4 KiB | 4 KiB–4608 B |
+| 64 KiB | 64 KiB–72 KiB (`MaxPacketSize`) |
+
+This mirrors `is_valid_packet_len()` in the client's `src/crypto/ratchet.rs`: a 283-byte packet (256 + 27 padding bytes) is valid, while one byte outside the grid on either side is rejected with `400`. Because the length is randomized inside the bucket, the exact `Content-Length` does not correlate with the plaintext size. `MaxPacketSize` is 73728 bytes (64 KiB + 8 KiB), and the body is read with a `MaxPacketSize + 1` limit so an oversized packet is rejected rather than silently truncated.
 
 ### Message and file retention
 
