@@ -187,6 +187,33 @@ HOST=relay.example.com REMOTE_DIR=/opt/lastchance-server ./deploy.sh
 container fails to exec the copied binary. Leave `bin/lc-server` absent from the
 build context to let the Docker builder compile inside the image instead.
 
+### Local helper script
+
+`start.sh` wraps the same compose stack for day-to-day operation on one host.
+It requires Docker with the Compose plugin, must be run from the repository
+root, and expects `.env` to contain the values from the deployment steps above.
+
+```bash
+./start.sh up        # default: config -> data -> compose up -> wait for healthy
+./start.sh config    # create the template if missing, then open it in $EDITOR
+./start.sh restart   # restart lc-server and wait for healthy
+./start.sh logs      # docker compose logs -f
+./start.sh health    # healthcheck status plus compose ps
+./start.sh status    # docker compose ps
+./start.sh down      # stop the stack
+```
+
+`up` is idempotent: it creates `~/.config/lc-server/config.toml` with mode
+`0600` only when absent, creates `./data` and chowns it to `10001:10001`
+(stopping with a `sudo chown` hint if that fails), runs
+`docker compose up -d --remove-orphans`, then waits up to 90 s for the
+container health check and prints `docker compose ps`. `config` falls back to
+`nano`, `vim` or `vi` when `$EDITOR` is unset and reminds you to restart
+afterwards; `restart` waits 60 s for health. The built-in template binds
+`0.0.0.0:8080` / `0.0.0.0:8081` and stores data under `/var/lib/lc-server`,
+so it is intended for the container rather than a local non-Docker run; review
+it against [Configuration](#configuration) before the first start.
+
 ### Caddy variants
 
 `Caddyfile` ships with one public domain:
